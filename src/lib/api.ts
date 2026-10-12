@@ -1,6 +1,7 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FreeKind, Line, Payment } from './format';
+import { localApi } from './local';
 
 export const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/$/, '');
 
@@ -21,7 +22,16 @@ let onUnauthorized: () => void = () => {};
 export const setToken = (t: string | null) => { token = t; };
 export const setOnUnauthorized = (fn: () => void) => { onUnauthorized = fn; };
 
-export async function api<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+type Init = { method?: string; body?: unknown };
+const ONLINE = ['/login', '/health', '/sync'];
+
+/** Screens call this. Everything is answered from the phone's database (works offline); only login and sync go to the server. */
+export function api<T>(path: string, init?: Init): Promise<T> {
+  return ONLINE.includes(path) ? remote<T>(path, init) : localApi<T>(path, init);
+}
+
+/** Call the server. Errors carry the HTTP `status` (none when the server could not be reached). */
+export async function remote<T>(path: string, init?: Init): Promise<T> {
   if (!API_URL) throw new Error('API URL is not configured (EXPO_PUBLIC_API_URL).');
   let res: Response;
   try {
@@ -35,7 +45,8 @@ export async function api<T>(path: string, init?: { method?: string; body?: unkn
   }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && token) onUnauthorized();
-  if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+  // data.error on a 2xx: TEST_ROLLBACK's 299 "rolled back" reply, which must not count as saved.
+  if (!res.ok || data.error) throw Object.assign(new Error(data.error ?? `Request failed (${res.status})`), { status: res.status });
   return data as T;
 }
 
@@ -49,7 +60,7 @@ export type DocInput = {
   payment?: Payment;
 };
 
-/** Invoice -> dbo.InvoiceHead; order and any draft -> sales.SalesOrders. */
+/** Saved on the phone, then on Sync: invoice -> dbo.InvoiceHead; order and any draft -> sales.SalesOrders. */
 export function submitDoc(target: 'invoice' | 'order' | 'draft', body: DocInput) {
   return target === 'invoice'
     ? api<Doc>('/invoices', { method: 'POST', body })

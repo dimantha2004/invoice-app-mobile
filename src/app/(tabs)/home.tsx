@@ -1,10 +1,11 @@
 import { router, type Href } from 'expo-router';
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { C, Ionicons, MaterialCommunityIcons, useDarkStatusBar } from '../../components/ui';
 import { useApi } from '../../lib/api';
 import { useStore } from '../../lib/store';
+import { discardOutbox, sync, SyncError } from '../../lib/sync';
 
 function StatCard({ title, count, icon, style, dark, onPress }: {
   title: string; count: number; icon: string; style: ViewStyle; dark?: boolean; onPress: () => void;
@@ -37,8 +38,29 @@ export default function Home() {
   useDarkStatusBar();
   const store = useStore();
   const insets = useSafeAreaInsets();
-  const stats = useApi<{ orders: number; invoices: number; payments: number }>('/stats');
-  const s = stats.data ?? { orders: 0, invoices: 0, payments: 0 };
+  const stats = useApi<{ orders: number; invoices: number; payments: number; pending: number }>('/stats');
+  const s = stats.data ?? { orders: 0, invoices: 0, payments: 0, pending: 0 };
+  const [syncing, setSyncing] = useState(false);
+
+  const runSync = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const { pushed } = await sync();
+      Alert.alert('Sync complete', `${pushed ? `Sent ${pushed} item${pushed > 1 ? 's' : ''} to the server. ` : ''}Latest data downloaded.`);
+    } catch (e) {
+      const err = e as Error;
+      if (err instanceof SyncError && err.rejected) {
+        Alert.alert('Sync stopped', `The server refused one item:\n${err.message}\n\nItems after it wait until this one is sent or discarded.`, [
+          { text: 'Keep', style: 'cancel' },
+          { text: 'Discard item', style: 'destructive', onPress: () => { discardOutbox(err.seq).then(stats.reload); } },
+        ]);
+      } else Alert.alert('Sync failed', `${err.message}\n\nYour work is saved on this phone. Try again when online.`);
+    } finally {
+      setSyncing(false);
+      stats.reload();
+    }
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: C.white, paddingTop: insets.top }}>
@@ -47,14 +69,15 @@ export default function Home() {
           <Ionicons name="menu" size={32} color={C.primary} />
         </Pressable>
         <Text style={st.title}>Home</Text>
-        <Pressable style={st.sync} onPress={async () => { await stats.reload(); Alert.alert('Sync', 'Refreshed from the server.'); }}>
+        <Pressable style={[st.sync, syncing && { opacity: 0.6 }]} onPress={runSync} accessibilityLabel="Sync with the server">
           <Ionicons name="sync" size={20} color={C.white} />
-          <Text style={{ color: C.white, fontSize: 18, fontWeight: '500' }}>Sync</Text>
+          <Text style={{ color: C.white, fontSize: 18, fontWeight: '500' }}>{syncing ? 'Syncing…' : 'Sync'}</Text>
         </Pressable>
       </View>
       <ScrollView contentContainerStyle={{ padding: 16, paddingTop: 4, gap: 12 }}>
         <Text style={{ color: C.muted, fontSize: 14 }}>
           Sales Representative: <Text style={{ color: C.textBlue, fontWeight: '700' }}>{store.user?.displayName}</Text>
+          {s.pending ? <Text style={{ color: C.warning }}>{`  ·  ${s.pending} not synced`}</Text> : null}
           {stats.error ? <Text style={{ color: C.danger }}>{'  ·  ' + stats.error}</Text> : null}
         </Text>
         <View style={{ flexDirection: 'row', gap: 10 }}>

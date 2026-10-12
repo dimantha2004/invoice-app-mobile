@@ -1,6 +1,7 @@
 import express from 'express';
 import sql from 'mssql';
 import { createThrottle, md5Candidates, signToken, verifyToken } from './auth.js';
+import { KIND_LIST, numberFormat, ownsNumber } from './numbers.js';
 import { splitPayment } from './payment.js';
 
 const env = process.env;
@@ -8,7 +9,7 @@ for (const k of ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'AUTH_SECRET'
   if (!env[k]) throw new Error(`Missing ${k} in server/.env (see .env.example)`);
 }
 
-// Where app-created POS invoices are booked. Invoice numbers follow the POS pattern INV{MAINLOC}{STATION}{0000001}.
+// Where app-created POS invoices are booked. Invoice numbers are INV{MAINLOC}{rep}{000001}, made on the phone (numbers.js).
 const MAINLOC = env.MOBILE_MAINLOC ?? 'MB';
 const STATION = Number(env.MOBILE_STATION ?? 1);
 const LOCATION = env.MOBILE_LOCATION ?? 'BAR';
@@ -83,8 +84,21 @@ const isoDate = (v, name, required = true) => {
   if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v) || isNaN(Date.parse(v))) bad(`Invalid ${name}`);
   return v;
 };
+/** A document number made on the phone: must be in the caller's own range (numbers.js). */
+const ownNo = (kind, user, v) => {
+  if (!ownsNumber(kind, MAINLOC, user.userId, v, bad)) bad(`Invalid ${kind} number ${v ?? ''}`.trim());
+  return v;
+};
+/**
+ * A synced number already in the ERP is either the same document sent again (the phone lost the reply and retried: fine)
+ * or a different one (the rep used two phones offline: refuse, never overwrite).
+ */
+const clash = no => new HttpError(409, `Number ${no} is already used by a different document. Use one phone per sales rep.`);
 
-/** Validate client lines and re-price them from inv.Products (never trust client prices). */
+/**
+ * Validate client lines and price them from inv.Products. Synced documents keep the price the phone printed
+ * (keepPrice); the product must still exist.
+ */
 async function priceLines(lines, tx, { keepPrice = false } = {}) {
   if (!Array.isArray(lines) || !lines.length) bad('Add at least one item');
   if (lines.length > 200) bad('Too many items');
@@ -93,6 +107,7 @@ async function priceLines(lines, tx, { keepPrice = false } = {}) {
     const id = Number(l.productId), n = Number(l.qty);
     if (!Number.isInteger(id) || id <= 0) bad('Invalid product');
     if (!Number.isInteger(n) || n <= 0 || n > 100000) bad('Quantity must be a whole number above 0');
+    if (keepPrice) money(l.price, 'price');
     qty.set(id, (qty.get(id) ?? 0) + n);
   }
   const rows = await q(`
@@ -102,7 +117,7 @@ async function priceLines(lines, tx, { keepPrice = false } = {}) {
   if (rows.length !== qty.size) bad('One or more items are no longer available');
   return rows.map(p => {
     const orig = lines.find(l => Number(l.productId) === p.ProductId);
-    const price = keepPrice ? Number(orig.price) : Number(p.SellingPrice);
+    const price = keepPrice ? money(orig.price, 'price') : Number(p.SellingPrice);
     const n = qty.get(p.ProductId);
     return { ...p, qty: n, price, amount: Math.round(price * n * 100) / 100 };
   });
@@ -190,16 +205,9 @@ app.get('/customers', async (req, res) => {
     ORDER BY c.CustomerName`, { search }));
 });
 
-app.get('/customers/next-code', async (_req, res) => res.json({ code: await nextCustomerCode() }));
-
-async function nextCustomerCode(tx) {
-  const [r] = await q(`SELECT MAX(CAST(SUBSTRING(CustomerCode, 6, 10) AS int)) n FROM sales.Customers WITH (UPDLOCK, HOLDLOCK)
-    WHERE CustomerCode LIKE 'CUS-M[0-9][0-9][0-9][0-9][0-9]'`, {}, tx);
-  return `CUS-M${String((r?.n ?? 0) + 1).padStart(5, '0')}`;
-}
-
 app.post('/customers', async (req, res) => {
   const b = req.body ?? {};
+  const code = ownNo('cus', req.user, b.code);
   const name = str(b.name, 255, 'Customer name', true);
   const phone = str(b.phone, 20, 'Contact number');
   if (phone && !/^\+?[0-9 ]{9,15}$/.test(phone)) bad('Invalid contact number');
@@ -208,7 +216,8 @@ app.post('/customers', async (req, res) => {
   const inactive = b.status === 'Inactive';
 
   const created = await inTx(async tx => {
-    const code = await nextCustomerCode(tx);
+    const [dup] = await q(`${customerSelect} WITH (UPDLOCK, HOLDLOCK) WHERE c.CustomerCode = @code`, { code }, tx);
+    if (dup) { if (dup.name?.trim() === name) return dup; throw clash(code); }
     const [r] = await q(`
       INSERT INTO sales.Customers (CompanyId, CustomerCode, CustomerName, CategoryEnum, BillingAddress, ShippingAddress, ContactNumber, CreationDate, CreatedUserId, ExpiryDate)
       OUTPUT INSERTED.CustomerId id
@@ -273,32 +282,44 @@ app.get('/invoices', async (req, res) => {
   res.json({ rows, ...counts });
 });
 
+/** Invoice lines; `doc` is the invoice number (groups lines when many invoices are loaded at once). */
+const invoiceLines = where => `
+  SELECT d.InvoiceNo doc, COALESCE(p.ProductId, 0) productId, d.MenuCode code, COALESCE(p.ProductDescription, d.MenuCode) name, ISNULL(u.UnitOfMeasure, 'Unit') unit,
+         CAST(d.Price AS float) price, CAST(d.Qty AS float) qty, CAST(d.Amount AS float) amount, ${FREE_SQL('d.Price', 'd.Amount', 'd.TranferID = 2')}
+  FROM dbo.InvoiceDetails d
+  LEFT JOIN inv.Products p ON p.ProductCode = d.MenuCode
+  LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = p.DefaultUnitOfMeasureId
+  WHERE ${where} ORDER BY d.ID`;
+
 async function invoiceWithLines(no, tx) {
   const [inv] = await q(`${invoiceSelect} WHERE h.InvoiceNo = @no`, { no }, tx);
   if (!inv) throw new HttpError(404, 'Invoice not found');
-  inv.lines = await q(`
-    SELECT COALESCE(p.ProductId, 0) productId, d.MenuCode code, COALESCE(p.ProductDescription, d.MenuCode) name, ISNULL(u.UnitOfMeasure, 'Unit') unit,
-           CAST(d.Price AS float) price, CAST(d.Qty AS float) qty, CAST(d.Amount AS float) amount, ${FREE_SQL('d.Price', 'd.Amount', 'd.TranferID = 2')}
-    FROM dbo.InvoiceDetails d
-    LEFT JOIN inv.Products p ON p.ProductCode = d.MenuCode
-    LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = p.DefaultUnitOfMeasureId
-    WHERE d.InvoiceNo = @no ORDER BY d.ID`, { no }, tx);
+  inv.lines = await q(invoiceLines('d.InvoiceNo = @no'), { no }, tx);
   return inv;
 }
 
 app.get('/invoices/:no', async (req, res) => res.json(await invoiceWithLines(str(req.params.no, 14, 'Invoice'))));
 
-/** Pay a pending invoice: split its credit balance across cash / cheque / online; whatever is left as credit keeps it pending. */
+/**
+ * Pay a pending invoice: split its credit balance across cash / cheque / online; whatever is left as credit keeps it pending.
+ * `due` is the balance the phone saw when the payment was taken offline. If the server already shows the balance after this
+ * payment, it is a retried sync and nothing is added twice.
+ */
 // ponytail: the payment is added to the invoice's own totals, so it counts on the invoice date in the daily summary.
 // Book it in sales.CustomerPayments if payments must be reported on the day they are received.
 app.post('/invoices/:no/pay', async (req, res) => {
   const no = str(req.params.no, 14, 'Invoice');
+  const seen = money(req.body?.due, 'balance');
   await inTx(async tx => {
     const [h] = await q(`SELECT CAST(CASE WHEN Credit = 1 THEN CreditAmt ELSE 0 END AS float) due FROM dbo.InvoiceHead WITH (UPDLOCK, HOLDLOCK)
       WHERE InvoiceNo = @no AND Cancled = 'N'`, { no }, tx);
     if (!h) throw new HttpError(404, 'Invoice not found');
+    const pay = splitPayment(req.body?.payment, seen, bad);
+    if (Math.abs(h.due - seen) > 0.005) {
+      if (Math.abs(h.due - pay.credit) <= 0.005) return; // already applied
+      throw new HttpError(409, `Invoice ${no}: the balance on the server is Rs. ${h.due.toFixed(2)}, not Rs. ${seen.toFixed(2)}. Payment not saved.`);
+    }
     if (h.due <= 0) bad('This invoice is already paid');
-    const pay = splitPayment(req.body?.payment, h.due, bad);
     if (pay.credit >= h.due) bad('Enter the amount being paid');
     await q(`UPDATE dbo.InvoiceHead SET Cash = Cash + @cash, Cheque = Cheque + @cheque, BankCard = BankCard + @online,
         CardName = CASE WHEN @online > 0 THEN 'ONLINE' ELSE CardName END, CreditAmt = @credit, Credit = @isCredit
@@ -307,12 +328,22 @@ app.post('/invoices/:no/pay', async (req, res) => {
   res.json(await invoiceWithLines(no));
 });
 
-async function nextInvoiceNo(tx) {
-  const prefix = `INV${MAINLOC}${STATION}`;
-  const [r] = await q(`SELECT MAX(InvoiceNo) last FROM dbo.InvoiceHead WITH (UPDLOCK, HOLDLOCK)
-    WHERE InvoiceNo LIKE @like AND LEN(InvoiceNo) = @len`, { like: `${prefix}%`, len: prefix.length + 7 }, tx);
-  const n = r?.last ? Number(r.last.slice(prefix.length)) + 1 : 1;
-  return `${prefix}${String(n).padStart(7, '0')}`;
+/**
+ * An invoice number made on the phone that is already in the ERP: true when it is the same invoice sent again
+ * (same customer and amount), a 409 when it is a different one.
+ */
+async function invoiceExists(tx, no, customerCode, net) {
+  const [h] = await q('SELECT Customer, CAST(NetAmount AS float) net FROM dbo.InvoiceHead WITH (UPDLOCK, HOLDLOCK) WHERE InvoiceNo = @no', { no }, tx);
+  if (!h) return false;
+  if (String(h.Customer).trim() === customerCode && Math.abs(h.net - net) <= 0.005) return true;
+  throw clash(no);
+}
+
+/** Customers are sent by code: one added offline has no CustomerId until it is synced. */
+async function customerByCode(code, tx) {
+  const [c] = await q('SELECT CustomerId, CustomerCode, CustomerName, BillingAddress FROM sales.Customers WHERE CustomerCode = @code', { code: str(code, 50, 'Customer', true) }, tx);
+  if (!c) bad(`Customer ${code} not found`);
+  return c;
 }
 
 async function customerById(id, tx) {
@@ -322,13 +353,13 @@ async function customerById(id, tx) {
   return c;
 }
 
-/** Insert a POS invoice with its payment split. Used by "Create Invoice" and order conversion. */
-async function insertInvoice(tx, user, { customer, date, dueDate, lines, discount, tax, notes, salesOrderNo, payment }) {
+/** Insert a POS invoice (number `no`, made on the phone) with its payment split. Used by "Create Invoice" and order conversion. */
+async function insertInvoice(tx, user, { no, customer, date, dueDate, lines, discount, tax, notes, salesOrderNo, payment }) {
   const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
   if (discount > gross) bad('Discount cannot be more than the total');
   const net = Math.round((gross - discount + tax) * 100) / 100;
   const pay = splitPayment(payment, net, bad);
-  const no = await nextInvoiceNo(tx);
+  if (await invoiceExists(tx, no, customer.CustomerCode, net)) return no;
   await q(`
     INSERT INTO dbo.InvoiceHead (InvoiceNo, MainLoc, Station, InvDate, InvTime, OrderDate, OrderType, CashierID, Steward, Customer, OrderCustomer,
       GrossAmount, Discount, TaxAmt, NetAmount, Cash, Cheque, BankCard, CardName, CreditAmt, Credit, Cancled, Location, Remarks, CreditRemarks)
@@ -356,7 +387,8 @@ app.post('/invoices', async (req, res) => {
   const dueDate = isoDate(b.dueDate, 'due date', false);
   if (dueDate && dueDate < date) bad('End date cannot be before start date');
   const no = await inTx(async tx => insertInvoice(tx, req.user, {
-    customer: await customerById(b.customerId, tx), date, dueDate, lines: await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx),
+    no: ownNo('inv', req.user, b.number), customer: await customerByCode(b.customerCode, tx), date, dueDate,
+    lines: await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx, { keepPrice: true }),
     discount: money(b.discount, 'discount'), tax: money(b.tax, 'tax'), notes: str(b.notes, 1000, 'Notes'), payment: b.payment,
   }));
   res.status(201).json(await invoiceWithLines(no));
@@ -364,8 +396,9 @@ app.post('/invoices', async (req, res) => {
 
 /* ---------- sales orders & drafts (sales.SalesOrders / SalesOrderLines) ---------- */
 
+// Orders are identified by DocNumber: one made offline has no SalesOrderId until it is synced.
 const orderSelect = `
-  SELECT CAST(o.SalesOrderId AS varchar) id, o.DocNumber number, 'order' kind,
+  SELECT o.DocNumber id, o.DocNumber number, 'order' kind,
          CASE o.StatusEnum WHEN ${ST.draft} THEN 'draft' WHEN ${ST.invoiced} THEN 'paid' ELSE 'pending' END status,
          o.CustomerId customerId, c.CustomerCode customerCode, ISNULL(c.CustomerName, 'Unknown') customerName, COALESCE(o.BillingAddress, c.BillingAddress) customerAddress,
          COALESCE(NULLIF(LTRIM(RTRIM(e.NameWithInitials)), ''), e.FullName, '') rep,
@@ -383,38 +416,41 @@ app.get('/orders', async (req, res) => {
     AND (o.DocNumber LIKE @search OR c.CustomerName LIKE @search) ORDER BY ${sort} OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY) x`, { search }));
 });
 
-async function orderWithLines(id, tx) {
-  const [o] = await q(`${orderSelect} WHERE o.SalesOrderId = @id`, { id }, tx);
+/** Order lines; `doc` is the order number (groups lines when many orders are loaded at once). */
+const orderLines = where => `
+  SELECT o.DocNumber doc, l.ProductId productId, p.ProductCode code, p.ProductDescription name, ISNULL(u.UnitOfMeasure, 'Unit') unit,
+         CAST(l.Price AS float) price, l.Quantity qty, CAST(l.NetValue AS float) amount, ${FREE_SQL('l.Price', 'l.NetValue', `l.Remarks = 'exchange'`)}
+  FROM sales.SalesOrderLines l JOIN sales.SalesOrders o ON o.SalesOrderId = l.SalesOrderId JOIN inv.Products p ON p.ProductId = l.ProductId
+  LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = l.DocUnitOfMeasureId
+  WHERE ${where} ORDER BY l.SalesOrderLineId`;
+
+async function orderWithLines(no, tx) {
+  const [o] = await q(`${orderSelect} WHERE o.DocNumber = @no`, { no }, tx);
   if (!o) throw new HttpError(404, 'Order not found');
-  o.lines = await q(`
-    SELECT l.ProductId productId, p.ProductCode code, p.ProductDescription name, ISNULL(u.UnitOfMeasure, 'Unit') unit,
-           CAST(l.Price AS float) price, l.Quantity qty, CAST(l.NetValue AS float) amount, ${FREE_SQL('l.Price', 'l.NetValue', `l.Remarks = 'exchange'`)}
-    FROM sales.SalesOrderLines l JOIN inv.Products p ON p.ProductId = l.ProductId
-    LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = l.DocUnitOfMeasureId
-    WHERE l.SalesOrderId = @id ORDER BY l.SalesOrderLineId`, { id }, tx);
+  o.lines = await q(orderLines('o.DocNumber = @no'), { no }, tx);
   return o;
 }
 
-const orderId = v => { const n = Number(v); if (!Number.isInteger(n) || n <= 0) bad('Invalid order'); return n; };
-app.get('/orders/:id', async (req, res) => res.json(await orderWithLines(orderId(req.params.id))));
+const orderNo = v => str(v, 50, 'Order', true);
+app.get('/orders/:no', async (req, res) => res.json(await orderWithLines(orderNo(req.params.no))));
 
 app.post('/orders', async (req, res) => {
   const b = req.body ?? {};
+  const docNumber = ownNo('mso', req.user, b.number);
   const status = b.status === 'draft' ? ST.draft : ST.submitted;
   const date = isoDate(b.date, 'date');
   const dueDate = isoDate(b.dueDate, 'due date', false);
   if (dueDate && dueDate < date) bad('End date cannot be before start date');
   const discount = money(b.discount, 'discount'), tax = money(b.tax, 'tax'), notes = str(b.notes, 1000, 'Notes');
 
-  const id = await inTx(async tx => {
-    const customer = await customerById(b.customerId, tx);
-    const lines = await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx);
+  await inTx(async tx => {
+    const customer = await customerByCode(b.customerCode, tx);
+    const lines = await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx, { keepPrice: true });
     const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
     if (discount > gross) bad('Discount cannot be more than the total');
     const net = Math.round((gross - discount + tax) * 100) / 100;
-    const [r] = await q(`SELECT MAX(CAST(SUBSTRING(DocNumber, 4, 10) AS int)) n FROM sales.SalesOrders WITH (UPDLOCK, HOLDLOCK)
-      WHERE DocNumber LIKE 'MSO[0-9][0-9][0-9][0-9][0-9][0-9]'`, {}, tx);
-    const docNumber = `MSO${String((r?.n ?? 0) + 1).padStart(6, '0')}`;
+    const [dup] = await q(`SELECT CustomerId, CAST(FinalValue AS float) net FROM sales.SalesOrders WITH (UPDLOCK, HOLDLOCK) WHERE DocNumber = @docNumber`, { docNumber }, tx);
+    if (dup) { if (dup.CustomerId === customer.CustomerId && Math.abs(dup.net - net) <= 0.005) return; throw clash(docNumber); }
     const [o] = await q(`
       INSERT INTO sales.SalesOrders (CompanyId, DocNumber, DocDate, StatusEnum, CustomerId, BillingAddress, SalesRepEmployeeId, DeliveryDate,
         GrossValueTotal, LineDiscTotal, DocDiscValue, TaxValueTotal, NetValue, FinalValue, Remarks, CreationDate, SubmittedDate, CreatedUserId)
@@ -432,45 +468,79 @@ app.post('/orders', async (req, res) => {
         VALUES (@id, @docNumber, @date, @status, @productId, @uom, @uom, @qty, @qty, @qty, @price, 0, 0, @amount, 0, @amount, @free, GETDATE(), @userId)`,
       { free: l.free ?? null, id: o.id, docNumber, date, status, productId: l.ProductId, uom: l.DefaultUnitOfMeasureId, qty: l.qty, price: l.price, amount: l.amount, userId: req.user.userId }, tx);
     }
-    return o.id;
   });
-  res.status(201).json(await orderWithLines(id));
+  res.status(201).json(await orderWithLines(docNumber));
 });
 
-/** Turn an order/draft into a POS invoice; the invoice keeps the order number in InvoiceHead.OrderCustomer. */
-app.post('/orders/:id/invoice', async (req, res) => {
-  const id = orderId(req.params.id);
-  const no = await inTx(async tx => {
-    const o = await orderWithLines(id, tx);
+/**
+ * Turn an order/draft into a POS invoice; the invoice keeps the order number in InvoiceHead.OrderCustomer.
+ * Body: { payment, number, date, dueDate } as taken on the phone.
+ */
+app.post('/orders/:no/invoice', async (req, res) => {
+  const order = orderNo(req.params.no);
+  const b = req.body ?? {};
+  const no = ownNo('inv', req.user, b.number);
+  const date = isoDate(b.date, 'date');
+  const dueDate = isoDate(b.dueDate, 'due date', false);
+  await inTx(async tx => {
+    const [done] = await q('SELECT OrderCustomer FROM dbo.InvoiceHead WITH (UPDLOCK, HOLDLOCK) WHERE InvoiceNo = @no', { no }, tx);
+    if (done) { if (String(done.OrderCustomer ?? '').trim() === order) return; throw clash(no); }
+    const o = await orderWithLines(order, tx);
     if (o.status === 'paid') bad('This order is already invoiced');
-    const today = new Date().toISOString().slice(0, 10);
-    const no = await insertInvoice(tx, req.user, {
-      customer: await customerById(o.customerId, tx), date: today, dueDate: o.dueDate > today ? o.dueDate : today,
-      lines: await pricedLines(o.lines.filter(l => !l.free), { sample: o.lines.filter(l => l.free === 'sample'), exchange: o.lines.filter(l => l.free === 'exchange') }, tx, { keepPrice: true }), discount: o.discount, tax: o.tax, notes: o.notes, salesOrderNo: o.number, payment: req.body?.payment,
+    await insertInvoice(tx, req.user, {
+      no, customer: await customerById(o.customerId, tx), date, dueDate: dueDate ?? date,
+      lines: await pricedLines(o.lines.filter(l => !l.free), { sample: o.lines.filter(l => l.free === 'sample'), exchange: o.lines.filter(l => l.free === 'exchange') }, tx, { keepPrice: true }), discount: o.discount, tax: o.tax, notes: o.notes, salesOrderNo: o.number, payment: b.payment,
     });
-    await q(`UPDATE sales.SalesOrders SET StatusEnum = ${ST.invoiced}, ModifiedUserId = @userId WHERE SalesOrderId = @id`, { id, userId: req.user.userId }, tx);
-    await q(`UPDATE sales.SalesOrderLines SET StatusEnum = ${ST.invoiced}, BalanceQuantity = 0 WHERE SalesOrderId = @id`, { id }, tx);
-    return no;
+    await q(`UPDATE sales.SalesOrders SET StatusEnum = ${ST.invoiced}, ModifiedUserId = @userId WHERE DocNumber = @order`, { order, userId: req.user.userId }, tx);
+    await q(`UPDATE sales.SalesOrderLines SET StatusEnum = ${ST.invoiced}, BalanceQuantity = 0
+      WHERE SalesOrderId IN (SELECT SalesOrderId FROM sales.SalesOrders WHERE DocNumber = @order)`, { order }, tx);
   });
   res.status(201).json(await invoiceWithLines(no));
 });
 
-/* ---------- dashboard ---------- */
+/* ---------- sync: everything the phone keeps offline ---------- */
 
-app.get('/stats', async (_req, res) => {
-  const [r] = await q(`
-    SELECT (SELECT COUNT(*) FROM sales.SalesOrders WHERE ExpiryDate IS NULL AND StatusEnum IN (${ST.draft}, ${ST.submitted})) orders,
-           (SELECT COUNT(*) FROM dbo.InvoiceHead WHERE Cancled = 'N' AND InvDate >= CAST(GETDATE() AS date)) invoices,
-           (SELECT COUNT(*) FROM dbo.InvoiceHead WHERE Cancled = 'N' AND InvDate >= CAST(GETDATE() AS date) AND NOT (Credit = 1 AND CreditAmt > 0)) payments`);
-  res.json(r);
+const NUMBER_COLUMNS = {
+  inv: ['dbo.InvoiceHead', 'InvoiceNo'], mso: ['sales.SalesOrders', 'DocNumber'], rtv: ['sales.SalesReturns', 'DocNumber'], cus: ['sales.Customers', 'CustomerCode'],
+};
+
+/** Group lines (each tagged with `doc`) under their documents. */
+const withLines = (docs, lines) => {
+  const by = new Map(docs.map(d => [d.id, Object.assign(d, { lines: [] })]));
+  for (const { doc, ...l } of lines) by.get(doc)?.lines.push(l);
+  return docs;
+};
+
+// ponytail: full customer/product lists on every sync. Send only rows changed since the last sync if they grow into the tens of thousands.
+app.get('/sync', async (req, res) => {
+  const u = req.user;
+  const params = { cashier: u.username.slice(0, 10), userId: u.userId };
+  const myInvoices = `SELECT h.InvoiceNo FROM dbo.InvoiceHead h WHERE h.Cancled = 'N' AND h.CashierID = @cashier
+    AND (h.InvDate >= DATEADD(day, -60, CAST(GETDATE() AS date)) OR (h.Credit = 1 AND h.CreditAmt > 0))`;
+  const myOrders = `SELECT o.SalesOrderId FROM sales.SalesOrders o WHERE o.ExpiryDate IS NULL AND o.CreatedUserId = @userId
+    AND o.StatusEnum IN (${ST.draft}, ${ST.submitted})`;
+  const formats = Object.fromEntries(KIND_LIST.map(k => [k, numberFormat(k, MAINLOC, u.userId, bad)]));
+  const [customers, products, invoices, invLines, orders, ordLines, ...lasts] = await Promise.all([
+    q(`${customerSelect} ORDER BY c.CustomerName`),
+    q(`SELECT p.ProductId id, p.ProductCode code, p.ProductDescription name, CAST(p.SellingPrice AS float) price, ISNULL(u.UnitOfMeasure, 'Unit') unit, p.Barcode barcode
+       FROM inv.Products p LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = p.DefaultUnitOfMeasureId WHERE p.ExpiryDate IS NULL`),
+    q(`${invoiceSelect} WHERE h.InvoiceNo IN (${myInvoices})`, params),
+    q(invoiceLines(`d.InvoiceNo IN (${myInvoices})`), params),
+    q(`${orderSelect} WHERE o.SalesOrderId IN (${myOrders})`, params),
+    q(orderLines(`o.SalesOrderId IN (${myOrders})`), params),
+    ...KIND_LIST.map(k => {
+      const [table, col] = NUMBER_COLUMNS[k], { prefix, digits } = formats[k];
+      return q(`SELECT MAX(${col}) last FROM ${table} WHERE ${col} LIKE @like AND LEN(${col}) = @len`, { like: `${prefix}%`, len: prefix.length + digits });
+    }),
+  ]);
+  const numbers = Object.fromEntries(KIND_LIST.map((k, i) => {
+    const last = lasts[i][0]?.last;
+    return [k, { ...formats[k], last: last ? Number(last.slice(formats[k].prefix.length)) : 0 }];
+  }));
+  res.json({ customers, products, invoices: withLines(invoices, invLines), orders: withLines(orders, ordLines), numbers });
 });
 
 /* ---------- returns (sales.SalesReturns / SalesReturnLines) ---------- */
-
-app.get('/returns/next-number', async (_req, res) => {
-  const [r] = await q(`SELECT MAX(CAST(SUBSTRING(DocNumber, 4, 10) AS int)) n FROM sales.SalesReturns WHERE DocNumber LIKE 'RTV[0-9][0-9][0-9][0-9][0-9][0-9]'`);
-  res.json({ number: `RTV${String((r?.n ?? 0) + 1).padStart(6, '0')}` });
-});
 
 app.post('/returns', async (req, res) => {
   const b = req.body ?? {};
@@ -483,11 +553,13 @@ app.post('/returns', async (req, res) => {
   const status = b.status === 'draft' ? ST.draft : ST.submitted;
 
   await inTx(async tx => {
-    const [dup] = await q('SELECT 1 x FROM sales.SalesReturns WITH (UPDLOCK, HOLDLOCK) WHERE DocNumber = @docNumber', { docNumber }, tx);
-    if (dup) bad('Return PO number already exists');
-    const lines = await priceLines(b.lines, tx);
+    const lines = await priceLines(b.lines, tx, { keepPrice: true });
     const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
     const net = Math.round((gross + tax) * 100) / 100;
+    // The number may be typed in (a customer's PO), so it is not range-checked; the same return sent again is a retried sync.
+    const [dup] = await q(`SELECT CreatedUserId userId, CAST(FinalValue AS float) net FROM sales.SalesReturns WITH (UPDLOCK, HOLDLOCK)
+      WHERE DocNumber = @docNumber`, { docNumber }, tx);
+    if (dup) { if (dup.userId === req.user.userId && Math.abs(dup.net - net) <= 0.005) return; throw new HttpError(409, `Return PO number ${docNumber} already exists`); }
     const [r] = await q(`
       INSERT INTO sales.SalesReturns (CompanyId, DocNumber, DocDate, StatusEnum, CustomerAddress, GrossValueTotal, LineDiscTotal, DocDiscValue,
         TaxValueTotal, NetValue, FinalValue, Remarks, CreationDate, SubmittedDate, CreatedUserId)

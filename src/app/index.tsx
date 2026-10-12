@@ -35,7 +35,7 @@ export default function Login() {
   };
   const sync = async () => {
     await ping();
-    Alert.alert('Sync', 'Data is saved directly to the server, so there is nothing pending.');
+    Alert.alert('Sync', 'Log in, then tap Sync on Home. Work saved offline stays on this phone until it is synced.');
   };
 
   return (
@@ -55,7 +55,7 @@ export default function Login() {
             <View style={st.online}>
               <View style={[st.dot, { backgroundColor: online === false ? C.danger : online ? C.success : C.muted }]} />
               <Text style={{ color: online === false ? C.danger : online ? C.success : C.muted, fontSize: 16 }}>
-                {online === false ? 'Offline' : online ? 'Online' : 'Checking…'}
+                {online === false ? 'Offline · saved logins only' : online ? 'Online' : 'Checking…'}
               </Text>
             </View>
           </View>

@@ -6,7 +6,7 @@ import { useDocSave } from '../components/useDocSave';
 import { useApi, type Customer } from '../lib/api';
 import { FREE_TYPES, mergeLines, rs, today, totals, type FreeKind, type Line, type Payment } from '../lib/format';
 
-/** Full "Create New Invoice" form (Invoice Items List). The invoice number is assigned by the server (POS numbering). */
+/** Full "Create New Invoice" form (Invoice Items List). The invoice number is made on the phone from the rep's own range. */
 export default function InvoiceForm() {
   const customers = useApi<Customer[]>('/customers?q=');
   const { save, saving } = useDocSave();
