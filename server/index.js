@@ -3,14 +3,17 @@ import sql from 'mssql';
 import { createThrottle, md5Candidates, signToken, verifyToken } from './auth.js';
 import { KIND_LIST, numberFormat, ownsNumber } from './numbers.js';
 import { splitPayment } from './payment.js';
+import { takeFrom } from './stock.js';
 
 const env = process.env;
 for (const k of ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'AUTH_SECRET']) {
   if (!env[k]) throw new Error(`Missing ${k} in server/.env (see .env.example)`);
 }
 
-// Where app-created POS invoices are booked. Invoice numbers are INV{MAINLOC}{rep}{000001}, made on the phone (numbers.js).
-const MAINLOC = env.MOBILE_MAINLOC ?? 'MB';
+// App invoices are booked under the rep's own outlet (adm.Companies.MainLoc, read at login) as INV{mainLoc}{rep}{000001},
+// made on the phone (numbers.js). Outlet POS numbers are 13 characters, ours 14, so the two never collide.
+// ponytail: numbers made offline before the switch still carry the old fixed code (MB); drop OLD_MAINLOC once every phone has synced.
+const OLD_MAINLOC = env.MOBILE_MAINLOC ?? 'MB';
 const STATION = Number(env.MOBILE_STATION ?? 1);
 const LOCATION = env.MOBILE_LOCATION ?? 'BAR';
 const DEFAULT_COMPANY = Number(env.DEFAULT_COMPANY_ID ?? 1);
@@ -86,7 +89,7 @@ const isoDate = (v, name, required = true) => {
 };
 /** A document number made on the phone: must be in the caller's own range (numbers.js). */
 const ownNo = (kind, user, v) => {
-  if (!ownsNumber(kind, MAINLOC, user.userId, v, bad)) bad(`Invalid ${kind} number ${v ?? ''}`.trim());
+  if (![user.mainLoc, OLD_MAINLOC].some(loc => ownsNumber(kind, loc, user.userId, v, bad))) bad(`Invalid ${kind} number ${v ?? ''}`.trim());
   return v;
 };
 /**
@@ -125,7 +128,7 @@ async function priceLines(lines, tx, { keepPrice = false } = {}) {
 
 /**
  * Sold lines plus free issues (samples and exchanges). A free issue is an ordinary document line with price 0 and amount 0:
- * it adds nothing to the totals but, being a normal line, the ERP's stock update takes it out of stock like any other item.
+ * it adds nothing to the totals but, being a normal line, it is taken out of stock like any other item (takeStock).
  */
 async function pricedLines(lines, free, tx, opts) {
   const out = await priceLines(lines, tx, opts);
@@ -156,24 +159,27 @@ app.post('/login', async (req, res) => {
   const [h1, h2] = md5Candidates(password);
   const [u] = await q(`
     SELECT TOP 1 l.LoginId, l.Username, COALESCE(l.CompanyId, uc.CompanyId) CompanyId, u.DisplayName, uc.EmployeeId,
-           COALESCE(NULLIF(LTRIM(RTRIM(e.NameWithInitials)), ''), NULLIF(LTRIM(RTRIM(e.FullName)), ''), u.DisplayName) RepName
+           COALESCE(NULLIF(LTRIM(RTRIM(e.NameWithInitials)), ''), NULLIF(LTRIM(RTRIM(e.FullName)), ''), u.DisplayName) RepName,
+           NULLIF(LTRIM(RTRIM(co.MainLoc)), '') MainLoc
     FROM adm.Logins l
     JOIN adm.Users u ON u.UserId = l.LoginId
     OUTER APPLY (SELECT TOP 1 EmployeeId, CompanyId FROM adm.UserCompanies WHERE UserId = u.UserId AND ExpiryDate IS NULL ORDER BY IsDefault DESC, EmployeeId DESC) uc
+    LEFT JOIN adm.Companies co ON co.CompanyId = COALESCE(l.CompanyId, uc.CompanyId, @defaultCompany)
     LEFT JOIN hr.Employees e ON e.EmployeeId = uc.EmployeeId
     WHERE l.Username = @username AND LOWER(l.PasswordHash) IN (@h1, @h2)
       AND (l.ExpiryDate IS NULL OR l.ExpiryDate > GETDATE()) AND (u.ExpiryDate IS NULL OR u.ExpiryDate > GETDATE())
       AND NOT (ISNULL(l.LockoutEnabled, 0) = 1 AND l.LockoutEndDate > GETDATE())`,
-  { username, h1, h2 });
+  { username, h1, h2, defaultCompany: DEFAULT_COMPANY });
 
   if (!u) {
     throttle.fail(key);
     throw new HttpError(401, 'Invalid username or password');
   }
   throttle.reset(key);
+  if (!u.MainLoc) throw new HttpError(403, 'Your company has no location code (MainLoc). Ask the office to set it up.');
   const user = {
     userId: u.LoginId, username: u.Username, displayName: u.RepName, employeeId: u.EmployeeId ?? null,
-    companyId: u.CompanyId ?? DEFAULT_COMPANY,
+    companyId: u.CompanyId ?? DEFAULT_COMPANY, mainLoc: u.MainLoc,
   };
   res.json({ token: signToken(user, env.AUTH_SECRET), user });
 });
@@ -186,7 +192,8 @@ app.get('/health', async (_req, res) => {
 // Everything below requires a valid token.
 app.use((req, _res, next) => {
   const user = verifyToken(req.get('authorization')?.replace(/^Bearer /, ''), env.AUTH_SECRET);
-  if (!user) throw new HttpError(401, 'Session expired. Please log in again.');
+  // Tokens from before mainLoc was added must log in again to get it.
+  if (!user?.mainLoc) throw new HttpError(401, 'Session expired. Please log in again.');
   req.user = user;
   next();
 });
@@ -368,17 +375,43 @@ async function insertInvoice(tx, user, { no, customer, date, dueDate, lines, dis
   {
     // ponytail: InvoiceHead has no transfer column, so online transfers use BankCard tagged CardName 'ONLINE'. Split it out if real card sales are added.
     cash: pay.cash, cheque: pay.cheque, online: pay.online, cardName: pay.online > 0 ? 'ONLINE' : 'XXX', credit: pay.credit, isCredit: pay.credit > 0,
-    no, mainLoc: MAINLOC, station: STATION, date, cashier: user.username.slice(0, 10),
+    no, mainLoc: user.mainLoc, station: STATION, date, cashier: user.username.slice(0, 10),
     steward: user.employeeId ? String(user.employeeId).slice(0, 5) : null, customer: customer.CustomerCode, salesOrderNo: salesOrderNo ?? null,
     gross, discount, tax, net, location: LOCATION, notes: notes || null, due: `Due:${dueDate ?? date}`,
   }, tx);
   for (const l of lines) {
     await q(`
-      INSERT INTO dbo.InvoiceDetails (InvoiceNo, MenuCode, ItemCode, Qty, Price, Amount, Cost, DiscUnitVal, DiscTotVal, TableLocationCharge, MainLoc, StockLocation, DiscountedUnitVal, TranferID)
-      VALUES (@no, @code, @code, @qty, @price, @amount, @cost, 0, 0, 0, @station, @station, @price, @free)`,
+      INSERT INTO dbo.InvoiceDetails (InvoiceNo, MenuCode, ItemCode, Qty, Price, Amount, Cost, DiscUnitVal, DiscTotVal, TableLocationCharge, MainLoc, StockLocation, DiscountedUnitVal, TranferID, UpdateStock)
+      VALUES (@no, @code, @code, @qty, @price, @amount, @cost, 0, 0, 0, @station, @station, @price, @free, 1)`,
     { free: FREE_ID[l.free] ?? null, no, code: l.ProductCode, qty: l.qty, price: l.price, amount: l.amount, cost: Number(l.LastCost ?? 0), station: String(STATION) }, tx);
   }
+  await takeStock(tx, user.companyId, no, lines);
   return no;
+}
+
+/**
+ * Take invoice lines (sold and free) out of the rep's warehouse (inv.WarehouseProducts), FIFO like the ERP's sp_Update_Stocks_INV:
+ * batches at the line's price first, then any other batch. Lines are inserted with UpdateStock = 1 so the ERP never takes them again.
+ * A product with no batch in the warehouse is logged to StockUpdateErrorMassage, as the ERP does, instead of blocking the sync.
+ */
+async function takeStock(tx, companyId, no, lines) {
+  const [wh] = await q('SELECT TOP 1 WarehouseId FROM inv.Warehouses WHERE CompanyId = @companyId AND IsDefault = 1', { companyId }, tx);
+  if (!wh) bad(`Company ${companyId} has no default warehouse to take stock from`);
+  for (const l of lines) {
+    const batches = await q(`
+      SELECT WarehouseProductId id, CAST(OnHandQuantity AS float) onHand FROM inv.WarehouseProducts WITH (UPDLOCK)
+      WHERE WarehouseId = @wh AND ProductId = @productId
+      ORDER BY CASE WHEN LastSelling = @price THEN 0 ELSE 1 END, InsertDate, WarehouseProductId`,
+    { wh: wh.WarehouseId, productId: l.ProductId, price: l.price }, tx);
+    const takes = takeFrom(batches, l.qty);
+    if (!takes.length) {
+      await q(`INSERT INTO dbo.StockUpdateErrorMassage (ERROR_MESSAGE, ERROR_SEVERITY, ERROR_STATE, CompanyID, ProductID) VALUES (@msg, 16, 1, @companyId, @productId)`,
+        { msg: `No stock record found. InvoiceNo=${no}, ProductID=${l.ProductId}, WarehouseID=${wh.WarehouseId}`, companyId, productId: l.ProductId }, tx);
+    }
+    for (const t of takes) {
+      await q('UPDATE inv.WarehouseProducts SET OnHandQuantity = OnHandQuantity - @qty, updatedAt = GETDATE() WHERE WarehouseProductId = @id', t, tx);
+    }
+  }
 }
 
 app.post('/invoices', async (req, res) => {
@@ -519,7 +552,7 @@ app.get('/sync', async (req, res) => {
     AND (h.InvDate >= DATEADD(day, -60, CAST(GETDATE() AS date)) OR (h.Credit = 1 AND h.CreditAmt > 0))`;
   const myOrders = `SELECT o.SalesOrderId FROM sales.SalesOrders o WHERE o.ExpiryDate IS NULL AND o.CreatedUserId = @userId
     AND o.StatusEnum IN (${ST.draft}, ${ST.submitted})`;
-  const formats = Object.fromEntries(KIND_LIST.map(k => [k, numberFormat(k, MAINLOC, u.userId, bad)]));
+  const formats = Object.fromEntries(KIND_LIST.map(k => [k, numberFormat(k, u.mainLoc, u.userId, bad)]));
   const [customers, products, invoices, invLines, orders, ordLines, ...lasts] = await Promise.all([
     q(`${customerSelect} ORDER BY c.CustomerName`),
     q(`SELECT p.ProductId id, p.ProductCode code, p.ProductDescription name, CAST(p.SellingPrice AS float) price, ISNULL(u.UnitOfMeasure, 'Unit') unit, p.Barcode barcode

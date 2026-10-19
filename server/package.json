@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node --env-file=.env index.js",
-    "check": "node auth.check.js && node numbers.check.js"
+    "check": "node auth.check.js && node numbers.check.js && node stock.check.js"
   },
   "engines": {
     "node": ">=20.6"
