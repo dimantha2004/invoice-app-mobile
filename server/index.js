@@ -1,7 +1,7 @@
 import express from 'express';
 import sql from 'mssql';
 import { createThrottle, md5Candidates, signToken, verifyToken } from './auth.js';
-import { KIND_LIST, numberFormat, ownsNumber } from './numbers.js';
+import { KIND_LIST, numberFormat, ownsNumber, ownsOldInvoiceNumber } from './numbers.js';
 import { splitPayment } from './payment.js';
 import { takeFrom } from './stock.js';
 
@@ -10,9 +10,10 @@ for (const k of ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'AUTH_SECRET'
   if (!env[k]) throw new Error(`Missing ${k} in server/.env (see .env.example)`);
 }
 
-// App invoices are booked under the rep's own outlet (adm.Companies.MainLoc, read at login) as INV{mainLoc}{rep}{000001},
+// App invoices are booked under the rep's own outlet (adm.Companies.MainLoc, read at login) as INV{mainLoc}{rep 4}{00001},
 // made on the phone (numbers.js). Outlet POS numbers are 13 characters, ours 14, so the two never collide.
-// ponytail: numbers made offline before the switch still carry the old fixed code (MB); drop OLD_MAINLOC once every phone has synced.
+// ponytail: numbers made offline before the switch still carry the old fixed code (MB) and 3-digit rep code; drop OLD_MAINLOC
+// and ownsOldInvoiceNumber once every phone has synced.
 const OLD_MAINLOC = env.MOBILE_MAINLOC ?? 'MB';
 const STATION = Number(env.MOBILE_STATION ?? 1);
 const LOCATION = env.MOBILE_LOCATION ?? 'BAR';
@@ -89,7 +90,9 @@ const isoDate = (v, name, required = true) => {
 };
 /** A document number made on the phone: must be in the caller's own range (numbers.js). */
 const ownNo = (kind, user, v) => {
-  if (![user.mainLoc, OLD_MAINLOC].some(loc => ownsNumber(kind, loc, user.userId, v, bad))) bad(`Invalid ${kind} number ${v ?? ''}`.trim());
+  const ok = ownsNumber(kind, user.mainLoc, user.userId, v, bad)
+    || (kind === 'inv' && [user.mainLoc, OLD_MAINLOC].some(loc => ownsOldInvoiceNumber(loc, user.userId, v)));
+  if (!ok) bad(`Invalid ${kind} number ${v ?? ''}`.trim());
   return v;
 };
 /**
