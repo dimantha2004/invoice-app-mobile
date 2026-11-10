@@ -43,3 +43,6 @@ yarn-error.*
 # API server
 server/node_modules/
 server/.env
+
+# build output (env files live here too)
+/build/

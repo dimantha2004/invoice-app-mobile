@@ -30,6 +30,11 @@ const pool = await new sql.ConnectionPool({
   options: { encrypt: env.DB_ENCRYPT === 'true', trustServerCertificate: true, instanceName: env.DB_INSTANCE || undefined },
 }).connect();
 
+// Some ERP installs have no InvoiceHead.CreditRemarks (where the due date is kept); there the due date falls back to the invoice date.
+const [{ dueCol }] = (await pool.request().query(`SELECT COL_LENGTH('dbo.InvoiceHead', 'CreditRemarks') dueCol`)).recordset;
+const HAS_DUE = dueCol != null;
+if (!HAS_DUE) console.warn('dbo.InvoiceHead has no CreditRemarks column: invoice due dates are not saved. Add it (varchar(max) NULL) to keep them.');
+
 const app = express();
 // Web build (expo start --web) calls from another origin; native apps ignore CORS.
 app.use((req, res, next) => {
@@ -261,7 +266,7 @@ const invoiceSelect = `
          CONVERT(char(10), h.InvDate, 23) date,
          CAST(h.Cash AS float) cash, CAST(h.Cheque AS float) cheque, CAST(h.BankCard AS float) online,
          CAST(CASE WHEN h.Credit = 1 THEN h.CreditAmt ELSE 0 END AS float) credit,
-         COALESCE(CASE WHEN h.CreditRemarks LIKE 'Due:____-__-__%' THEN SUBSTRING(h.CreditRemarks, 5, 10) END, CONVERT(char(10), h.InvDate, 23)) dueDate,
+         COALESCE(${HAS_DUE ? `CASE WHEN h.CreditRemarks LIKE 'Due:____-__-__%' THEN SUBSTRING(h.CreditRemarks, 5, 10) END` : 'NULL'}, CONVERT(char(10), h.InvDate, 23)) dueDate,
          CAST(h.GrossAmount AS float) subTotal, CAST(h.Discount AS float) discount, CAST(h.TaxAmt AS float) tax, CAST(h.NetAmount AS float) net,
          ISNULL(NULLIF(LTRIM(RTRIM(h.Remarks)), '0'), '') notes, NULLIF(h.OrderCustomer, '') salesOrderNo
   FROM dbo.InvoiceHead h
@@ -372,9 +377,9 @@ async function insertInvoice(tx, user, { no, customer, date, dueDate, lines, dis
   if (await invoiceExists(tx, no, customer.CustomerCode, net)) return no;
   await q(`
     INSERT INTO dbo.InvoiceHead (InvoiceNo, MainLoc, Station, InvDate, InvTime, OrderDate, OrderType, CashierID, Steward, Customer, OrderCustomer,
-      GrossAmount, Discount, TaxAmt, NetAmount, Cash, Cheque, BankCard, CardName, CreditAmt, Credit, Cancled, Location, Remarks, CreditRemarks)
+      GrossAmount, Discount, TaxAmt, NetAmount, Cash, Cheque, BankCard, CardName, CreditAmt, Credit, Cancled, Location, Remarks${HAS_DUE ? ', CreditRemarks' : ''})
     VALUES (@no, @mainLoc, @station, @date, GETDATE(), @date, 'MOBILE', @cashier, @steward, @customer, @salesOrderNo,
-      @gross, @discount, @tax, @net, @cash, @cheque, @online, @cardName, @credit, @isCredit, 'N', @location, @notes, @due)`,
+      @gross, @discount, @tax, @net, @cash, @cheque, @online, @cardName, @credit, @isCredit, 'N', @location, @notes${HAS_DUE ? ', @due' : ''})`,
   {
     // ponytail: InvoiceHead has no transfer column, so online transfers use BankCard tagged CardName 'ONLINE'. Split it out if real card sales are added.
     cash: pay.cash, cheque: pay.cheque, online: pay.online, cardName: pay.online > 0 ? 'ONLINE' : 'XXX', credit: pay.credit, isCredit: pay.credit > 0,
