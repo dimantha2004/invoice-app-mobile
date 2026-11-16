@@ -2,6 +2,7 @@ import { router } from 'expo-router';
 import { useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useApi, useDebounced, type Customer } from '../lib/api';
+import { inactiveMsg } from '../lib/local';
 import { CustomerSheet } from './sheets';
 import { Btn, C, Header, Ionicons, MaterialCommunityIcons, SearchBar, TabBar } from './ui';
 
@@ -16,7 +17,7 @@ export function CustomerPicker({ title = 'Select Customers', inTab = false }: { 
 
   const next = () => {
     if (!selected) return Alert.alert('Select a customer first');
-    if (selected.status === 'Inactive') return Alert.alert('This customer is inactive');
+    if (selected.status === 'Inactive') return Alert.alert('Customer is inactive', inactiveMsg(selected.name));
     router.push({ pathname: '/new-invoice', params: { customerId: selected.id, customerName: selected.name, kind } });
   };
 

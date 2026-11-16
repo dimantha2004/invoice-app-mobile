@@ -4,6 +4,7 @@ import { CustomerSheet, ItemPickerSheet, PaymentSheet } from '../components/shee
 import { AddLink, Btn, ButtonRow, C, DateField, Field, ItemsBox, NotesBox, Screen, SelectField, TotalsCard } from '../components/ui';
 import { useDocSave } from '../components/useDocSave';
 import { useApi, type Customer } from '../lib/api';
+import { inactiveMsg } from '../lib/local';
 import { FREE_TYPES, mergeLines, rs, today, totals, type FreeKind, type Line, type Payment } from '../lib/format';
 
 /** Full "Create New Invoice" form (Invoice Items List). The invoice number is made on the phone from the rep's own range. */
@@ -26,6 +27,8 @@ export default function InvoiceForm() {
 
   const submit = (target: 'invoice' | 'draft', payment?: Payment) => {
     if (!customerId) return Alert.alert('Select a customer');
+    const c = customers.data?.find(x => String(x.id) === customerId);
+    if (c?.status === 'Inactive') return Alert.alert('Customer is inactive', inactiveMsg(c.name));
     if (!start) return Alert.alert('Select the start date');
     if (end && end < start) return Alert.alert('End date cannot be before start date');
     if (!lines.length) return Alert.alert('Add at least one item');
@@ -44,7 +47,7 @@ export default function InvoiceForm() {
       <Text style={{ fontSize: 20, fontWeight: '600', color: C.text }}>Create New Invoice</Text>
       <Field placeholder="Invoice Number (auto-generated)" editable={false} />
       <SelectField placeholder={customers.loading ? 'Loading customers…' : customers.error ? 'Customers unavailable' : 'Customer'} value={customerId} onChange={setCustomerId}
-        options={(customers.data ?? []).filter(c => c.status !== 'Inactive').map(c => ({ label: `${c.name} (${c.code})`, value: String(c.id) }))} />
+        options={(customers.data ?? []).map(c => ({ label: `${c.name} (${c.code})${c.status === 'Inactive' ? ' · Inactive' : ''}`, value: String(c.id) }))} />
       <Pressable onPress={() => setAddingCustomer(true)} style={{ alignSelf: 'flex-end', marginTop: -6 }} hitSlop={8}>
         <Text style={{ color: C.textBlue, fontWeight: '700', fontSize: 15 }}>Add New Customer</Text>
       </Pressable>

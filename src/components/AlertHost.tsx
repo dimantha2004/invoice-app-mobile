@@ -7,7 +7,7 @@ let push: ((m: Msg) => void) | null = null;
 
 // react-native-web's Alert.alert is a no-op, so on web route it into an in-app dialog (phones keep the native one).
 if (Platform.OS === 'web') {
-  Alert.alert = (title, message, buttons) => push?.({ title, message, buttons: buttons?.length ? buttons : [{ text: 'OK' }] });
+  Alert.alert = (title, message, buttons) => push?.({ title: title ?? '', message: message ?? undefined, buttons: buttons?.length ? buttons : [{ text: 'OK' }] });
 }
 
 /** Renders Alert.alert calls on web. Mounted once in the root layout. */

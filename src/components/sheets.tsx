@@ -67,8 +67,10 @@ export function CustomerSheet({ visible, onClose, onCreated }: { visible: boolea
 
   const submit = async () => {
     const name = f.name.trim(), phone = f.phone.trim();
-    if (!name) return Alert.alert('Customer name is required');
-    if (phone && !/^\+?[0-9 ]{9,15}$/.test(phone)) return Alert.alert('Invalid contact number');
+    const missing = ([['Customer Type', f.type], ['Customer Name', name], ['Contact Number', phone], ['Billing Address Line 1', f.address1], ['City', f.city]] as const)
+      .filter(([, v]) => !v.trim()).map(([label]) => `• ${label}`);
+    if (missing.length) return Alert.alert('Please fill all required fields', missing.join('\n'));
+    if (!/^\+?[0-9 ]{9,15}$/.test(phone)) return Alert.alert('Invalid contact number');
     setSaving(true);
     try {
       const c = await api<Customer>('/customers', { method: 'POST', body: { ...f, name, phone } });
@@ -86,13 +88,13 @@ export function CustomerSheet({ visible, onClose, onCreated }: { visible: boolea
   return (
     <Sheet visible={visible} title="Add New Customer" onClose={onClose}
       footer={<Btn title={saving ? 'Saving…' : 'Add Customer'} onPress={saving ? () => {} : submit} style={{ flexGrow: 0, flexBasis: 'auto', marginTop: 16 }} />}>
-      <SelectField placeholder="Customer Type" value={f.type} options={CUSTOMER_TYPES} onChange={set('type')} />
+      <SelectField placeholder="Customer Type *" value={f.type} options={CUSTOMER_TYPES} onChange={set('type')} />
       <Field value={next?.code ? `#${next.code}` : ''} placeholder="Customer Code (auto)" editable={false} style={{ color: '#555' }} />
-      <Field placeholder="Customer Name" value={f.name} onChangeText={set('name')} />
-      <Field placeholder="Contact Number" value={f.phone} onChangeText={set('phone')} keyboardType="phone-pad" />
-      <Field placeholder="Billing Address  Line 1" value={f.address1} onChangeText={set('address1')} />
-      <Field placeholder="Billing Address  Line 2" value={f.address2} onChangeText={set('address2')} />
-      <Field placeholder="City" value={f.city} onChangeText={set('city')} />
+      <Field placeholder="Customer Name *" value={f.name} onChangeText={set('name')} />
+      <Field placeholder="Contact Number *" value={f.phone} onChangeText={set('phone')} keyboardType="phone-pad" />
+      <Field placeholder="Billing Address  Line 1 *" value={f.address1} onChangeText={set('address1')} />
+      <Field placeholder="Billing Address  Line 2 (optional)" value={f.address2} onChangeText={set('address2')} />
+      <Field placeholder="City *" value={f.city} onChangeText={set('city')} />
       <SelectField placeholder="Customer Status" value={f.status} options={CUSTOMER_STATUSES} onChange={set('status')} />
     </Sheet>
   );

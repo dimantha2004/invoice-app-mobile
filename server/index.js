@@ -629,4 +629,8 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = Number(env.PORT ?? 4000);
-app.listen(port, '0.0.0.0', () => console.log(`Invoice API listening on http://0.0.0.0:${port}`));
+// Express 5 passes listen errors (e.g. EADDRINUSE: port already taken) to this callback instead of throwing.
+app.listen(port, '0.0.0.0', err => {
+  if (err) { console.error(`Cannot listen on port ${port}: ${err.message}`); process.exit(1); }
+  console.log(`Invoice API listening on http://0.0.0.0:${port}`);
+});

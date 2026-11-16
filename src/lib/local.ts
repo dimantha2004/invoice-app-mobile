@@ -55,8 +55,11 @@ async function priceLines(x: Db, lines: { productId: number; qty: number }[] | u
 }
 
 /** Invoice/order fields from the form, plus the body the server needs to store exactly this document. */
+export const inactiveMsg = (name: string) => `${name} is inactive. You cannot create invoices or orders for an inactive customer.`;
+
 async function build(x: Db, b: DocInput) {
   const c = (await x.getFirstAsync<Customer>('SELECT * FROM customers WHERE id = ?', Number(b.customerId))) ?? fail('Customer not found');
+  if (c.status === 'Inactive') fail(inactiveMsg(c.name));
   const date = isoDate(b.date, 'date');
   const dueDate = b.dueDate ? isoDate(b.dueDate, 'due date') : date;
   if (dueDate < date) fail('End date cannot be before start date');
@@ -146,9 +149,10 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
   if (method === 'POST') {
     if (p === '/customers') {
       const name = str(b.name, 255, 'Customer name', true);
-      const phone = str(b.phone, 20, 'Contact number');
-      if (phone && !/^\+?[0-9 ]{9,15}$/.test(phone)) fail('Invalid contact number');
-      const address = [str(b.address1, 100, 'Address line 1'), str(b.address2, 100, 'Address line 2'), str(b.city, 50, 'City')].filter(Boolean).join(', ');
+      str(b.type, 50, 'Customer type', true);
+      const phone = str(b.phone, 20, 'Contact number', true);
+      if (!/^\+?[0-9 ]{9,15}$/.test(phone)) fail('Invalid contact number');
+      const address = [str(b.address1, 100, 'Address line 1', true), str(b.address2, 100, 'Address line 2'), str(b.city, 50, 'City', true)].filter(Boolean).join(', ');
       return write(async tx => {
         const code = await takeNo(tx, 'cus');
         // Not in the ERP yet, so no CustomerId: offline customers get negative ids until the next sync replaces them.
@@ -186,6 +190,8 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
       return write(async tx => {
         const o = await getDoc(tx, order, 'order');
         if (o.status === 'paid') fail('This order is already invoiced');
+        const c = await tx.getFirstAsync<{ status: string }>('SELECT status FROM customers WHERE id = ?', o.customerId);
+        if (c?.status === 'Inactive') fail(inactiveMsg(o.customerName));
         const date = today(), dueDate = o.dueDate > date ? o.dueDate : date;
         const pay = splitPayment(b.payment, o.net);
         const no = await takeNo(tx, 'inv');

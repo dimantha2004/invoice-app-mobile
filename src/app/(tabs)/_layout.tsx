@@ -6,9 +6,7 @@ export default function TabLayout() {
     <Tabs
       screenOptions={{ headerShown: false }}
       backBehavior="history"
-      tabBar={({ state, navigation }) => (
-        <TabBar active={state.routes[state.index].name as TabName} onPress={name => navigation.navigate(name)} />
-      )}>
+      tabBar={({ state }) => <TabBar active={state.routes[state.index].name as TabName} />}>
       <Tabs.Screen name="home" />
       <Tabs.Screen name="invoices" />
       <Tabs.Screen name="customers" />

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Alert, Text } from 'react-native';
 import { ItemPickerSheet } from '../components/sheets';
 import { AddLink, Btn, ButtonRow, C, DateField, Field, goTab, ItemsBox, NotesBox, Screen, SelectField, TotalsCard } from '../components/ui';
@@ -9,7 +9,7 @@ import { CITIES, RETURN_REASONS } from '../lib/store';
 /** Return Items -> sales.SalesReturns / SalesReturnLines. */
 export default function ReturnItems() {
   const next = useApi<{ number: string }>('/returns/next-number');
-  const [number, setNumber] = useState('');
+  const [typed, setNumber] = useState('');
   const [date, setDate] = useState('');
   const [reason, setReason] = useState('');
   const [city, setCity] = useState('');
@@ -20,7 +20,7 @@ export default function ReturnItems() {
   const [saving, setSaving] = useState(false);
   const { subTotal, net } = totals(lines, 0, tax);
 
-  useEffect(() => { if (next.data && !number) setNumber(next.data.number); }, [next.data, number]);
+  const number = typed || next.data?.number || ''; // empty field falls back to the suggested number
 
   const save = async (status: 'draft' | 'created') => {
     const num = number.trim().replace(/^#/, '');
