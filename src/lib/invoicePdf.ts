@@ -2,7 +2,7 @@ import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { Alert, Platform } from 'react-native';
 import type { Doc } from './api';
-import { dmy, FREE_TYPES, freeNote, payLabel } from './format';
+import { dmy, FREE_TYPES, freeNote, payLabel, payParts } from './format';
 import { LOGO_URI } from './logo';
 import { COMPANY } from './store';
 
@@ -45,7 +45,7 @@ export function invoiceHtml(d: Doc) {
   <table><tr><th>Item #</th><th>Item</th><th>Qty</th><th class="r">Price</th><th class="r">Total</th></tr>${rows}</table>
   <div class="tot"><div><span>Sub Total</span><b>Rs.${d.subTotal.toFixed(2)}</b></div><div><span>Discount</span><b>${d.discount.toFixed(2)}</b></div>
   <div><span>Tax</span><b>${d.tax.toFixed(2)}</b></div><div class="blue"><span>Total</span><span>Rs.${d.net.toFixed(2)}</span></div>
-  ${payLabel(d) ? `<div><span>Payment</span><b>${payLabel(d)}</b></div>` : ''}${d.credit ? `<div><span>Balance Due</span><b>Rs.${d.credit.toFixed(2)}</b></div>` : ''}</div>
+  ${payLabel(d) ? `<div><span>Payment</span><b>${payLabel(d)}</b></div>` : ''}${payParts(d).map(([label, amt]) => `<div><span>&nbsp;&nbsp;${label}</span><b>Rs.${amt.toFixed(2)}</b></div>`).join('')}${d.credit ? `<div><span>Balance Due</span><b>Rs.${d.credit.toFixed(2)}</b></div>` : ''}</div>
   ${FREE_TYPES.map(([k, title]) => (freeNote(d.lines, k) ? `<p><b>${title} (not charged)</b>: ${esc(freeNote(d.lines, k))}</p>` : '')).join('')}
   ${d.notes ? `<p><b>Notes</b>: ${esc(d.notes)}</p>` : ''}<div class="bar"></div></body></html>`;
 }

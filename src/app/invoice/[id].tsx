@@ -4,7 +4,7 @@ import { InvoiceActions } from '../../components/InvoiceActions';
 import { BADGE } from '../../components/InvoiceList';
 import { C, Screen } from '../../components/ui';
 import { useApi, type Doc } from '../../lib/api';
-import { dmy, FREE_TYPES, freeNote, payLabel } from '../../lib/format';
+import { dmy, FREE_TYPES, freeNote, payLabel, payParts } from '../../lib/format';
 import { COMPANY } from '../../lib/store';
 
 export default function InvoiceDetail() {
@@ -69,6 +69,9 @@ export default function InvoiceDetail() {
             <Text style={[st.small, st.blue]}>Total</Text><Text style={[st.small, st.blue]}>Rs.{d.net.toFixed(2)}</Text>
           </View>
           {payLabel(d) ? <View style={st.totRow}><Text style={st.small}>Payment</Text><Text style={[st.small, st.b]}>{payLabel(d)}</Text></View> : null}
+          {payParts(d).map(([label, amt]) => (
+            <View key={label} style={st.totRow}><Text style={st.small}>  {label}</Text><Text style={[st.small, st.b]}>Rs.{amt.toFixed(2)}</Text></View>
+          ))}
           {d.credit ? <View style={st.totRow}><Text style={st.small}>Balance Due</Text><Text style={[st.small, st.b]}>Rs.{d.credit.toFixed(2)}</Text></View> : null}
         </View>
         {FREE_TYPES.map(([k, title]) => !!freeNote(d.lines, k) && (

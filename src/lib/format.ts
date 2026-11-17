@@ -12,6 +12,10 @@ export type Payment = { cash: number; cheque: number; online: number; credit: nu
 export const PAY_TYPES = [['cash', 'Cash'], ['cheque', 'Cheque'], ['online', 'Online Transfer'], ['credit', 'Credit']] as const;
 /** { cash: 600, credit: 400 } -> "Cash + Credit" */
 export const payLabel = (p: Partial<Payment>) => PAY_TYPES.filter(([k]) => (p[k] ?? 0) > 0).map(([, label]) => label).join(' + ');
+/** Amount paid per type for a mix payment: { cash: 600, cheque: 300, credit: 100 } -> [['Cash', 600], ['Cheque', 300]].
+ *  Empty for a single payment type; credit is left out (it's shown as Balance Due). */
+export const payParts = (p: Partial<Payment>) => !payLabel(p).includes(' + ') ? [] :
+  PAY_TYPES.filter(([k]) => k !== 'credit' && (p[k] ?? 0) > 0).map(([k, label]) => [label, p[k]!] as const);
 
 /** Free issues: items given without charge (never in the invoice amount, only taken out of stock). */
 export type FreeKind = 'sample' | 'exchange';
