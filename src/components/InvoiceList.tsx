@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useApi, useDebounced, type Doc, type DocStatus } from '../lib/api';
 import { dmy, rs } from '../lib/format';
-import { C, Header, MaterialCommunityIcons, SearchBar, Sheet, TabBar } from './ui';
+import { Btn, C, DateField, Header, MaterialCommunityIcons, SearchBar, Sheet, TabBar } from './ui';
 
 const SORTS = { newest: 'Newest first', oldest: 'Oldest first', amount: 'Highest amount' } as const;
 type Sort = keyof typeof SORTS;
@@ -12,7 +12,9 @@ export const BADGE: Record<DocStatus, { label: string; color: string; bg: string
   pending: { label: 'Pending', color: C.warning, bg: '#FFF4E0' },
   paid: { label: 'Paid', color: C.success, bg: '#E3F6E9' },
   draft: { label: 'Draft', color: C.muted, bg: '#F0F0F0' },
+  returned: { label: 'Returned', color: C.textBlue, bg: '#E8EFFD' },
 };
+const KIND_LABEL = { invoice: 'Invoice', order: 'Order', return: 'Return' } as const;
 
 export const openDoc = (d: Pick<Doc, 'id' | 'kind'>) => router.push({ pathname: '/invoice/[id]', params: { id: d.id, kind: d.kind } });
 
@@ -21,7 +23,7 @@ export function DocCard({ d }: { d: Doc }) {
   return (
     <Pressable style={st.card} onPress={() => openDoc(d)}>
       <View style={{ flex: 1, gap: 4 }}>
-        <Text style={{ color: C.textBlue, fontSize: 16 }}>{d.kind === 'order' ? 'Order' : 'Invoice'} #{d.number}</Text>
+        <Text style={{ color: C.textBlue, fontSize: 16 }}>{KIND_LABEL[d.kind]} #{d.number}</Text>
         <Text style={{ fontSize: 16, fontStyle: 'italic', color: C.text }} numberOfLines={1}>{d.customerName}</Text>
         <Text style={{ fontSize: 16, color: C.lightText }}>{dmy(d.date)}</Text>
       </View>
@@ -36,30 +38,38 @@ export function DocCard({ d }: { d: Doc }) {
   );
 }
 
-/** Invoices tab (All / Pending / Paid) from dbo.InvoiceHead; "orders" mode lists sales orders and drafts. */
-export function InvoiceList({ title, mode = 'all', inTab = false }: { title: string; mode?: 'all' | 'orders' | 'paid'; inTab?: boolean }) {
+/** Invoices tab (All / Pending / Paid) from dbo.InvoiceHead; "orders" mode lists sales orders and drafts, "returns" the rep's returns. */
+export function InvoiceList({ title, mode = 'all', inTab = false }: { title: string; mode?: 'all' | 'orders' | 'paid' | 'returns'; inTab?: boolean }) {
   const [q, setQ] = useState('');
   const search = encodeURIComponent(useDebounced(q.trim()));
   const [tab, setTab] = useState<'all' | 'pending' | 'paid'>(mode === 'paid' ? 'paid' : 'all');
   const [sort, setSort] = useState<Sort>('newest');
+  const [date, setDate] = useState('');
   const [sortOpen, setSortOpen] = useState(false);
+  const isList = mode === 'orders' || mode === 'returns'; // plain lists, no status tabs
+  const filter = `q=${search}&sort=${sort}&date=${date}`;
 
-  const orders = useApi<Doc[]>(mode === 'orders' ? `/orders?q=${search}&sort=${sort}` : null);
-  const invoices = useApi<{ rows: Doc[]; count: number }>(mode !== 'orders' ? `/invoices?status=${tab}&q=${search}&sort=${sort}` : null);
-  const res = mode === 'orders' ? orders : invoices;
-  const list = mode === 'orders' ? orders.data ?? [] : invoices.data?.rows ?? [];
+  const docs = useApi<Doc[]>(isList ? `/${mode}?${filter}` : null);
+  const invoices = useApi<{ rows: Doc[]; count: number }>(!isList ? `/invoices?status=${tab}&${filter}` : null);
+  const res = isList ? docs : invoices;
+  const list = isList ? docs.data ?? [] : invoices.data?.rows ?? [];
 
   return (
     <View style={{ flex: 1, backgroundColor: C.white }}>
       <Header title={title} />
       <View style={{ padding: 16, paddingBottom: 0, gap: 12 }}>
         <View style={{ flexDirection: 'row', gap: 8 }}>
-          <SearchBar value={q} onChangeText={setQ} placeholder={mode === 'orders' ? 'Search Orders' : 'Search Invoices'} style={{ flex: 1 }} />
-          <Pressable style={st.filter} onPress={() => setSortOpen(true)} accessibilityLabel="Sort">
+          <SearchBar value={q} onChangeText={setQ} placeholder={`Search ${mode === 'orders' ? 'Orders' : mode === 'returns' ? 'Returns' : 'Invoices'}`} style={{ flex: 1 }} />
+          <Pressable style={[st.filter, !!date && { backgroundColor: C.textBlue }]} onPress={() => setSortOpen(true)} accessibilityLabel="Filter and sort">
             <MaterialCommunityIcons name="filter-variant" size={28} color={C.white} />
           </Pressable>
         </View>
-        {mode !== 'orders' && (
+        {!!date && (
+          <Pressable onPress={() => setDate('')} accessibilityRole="button">
+            <Text style={{ color: C.textBlue, fontSize: 15 }}>Showing {dmy(date)} only · <Text style={{ fontWeight: '700' }}>Clear</Text></Text>
+          </Pressable>
+        )}
+        {!isList && (
           <View style={{ flexDirection: 'row' }}>
             {(['all', 'pending', 'paid'] as const).map(t => (
               <Pressable key={t} onPress={() => setTab(t)} style={[st.tab, tab === t && { backgroundColor: C.primary }]} accessibilityRole="tab">
@@ -83,7 +93,20 @@ export function InvoiceList({ title, mode = 'all', inTab = false }: { title: str
         }
         renderItem={({ item }) => <DocCard d={item} />}
       />
-      <Sheet visible={sortOpen} title="Sort by" onClose={() => setSortOpen(false)}>
+      {mode === 'returns' && (
+        <View style={{ padding: 16, paddingTop: 0 }}>
+          <Btn title="New Return" onPress={() => router.push('/return-form')} style={{ flexGrow: 0, flexBasis: 'auto' }} />
+        </View>
+      )}
+      <Sheet visible={sortOpen} title="Filter" onClose={() => setSortOpen(false)}>
+        <Text style={{ fontSize: 15, fontWeight: '700', color: C.text, marginBottom: 6 }}>Date</Text>
+        <DateField placeholder="Any date" value={date} onChange={v => { setDate(v); setSortOpen(false); }} />
+        {!!date && (
+          <Pressable style={{ paddingVertical: 10 }} onPress={() => { setDate(''); setSortOpen(false); }}>
+            <Text style={{ fontSize: 16, color: C.textBlue }}>Show all dates</Text>
+          </Pressable>
+        )}
+        <Text style={{ fontSize: 15, fontWeight: '700', color: C.text, marginTop: 16 }}>Sort by</Text>
         {(Object.keys(SORTS) as Sort[]).map(k => (
           <Pressable key={k} style={{ paddingVertical: 14 }} onPress={() => { setSort(k); setSortOpen(false); }}>
             <Text style={{ fontSize: 16, color: k === sort ? C.textBlue : C.text, fontWeight: k === sort ? '700' : '400' }}>{SORTS[k]}</Text>

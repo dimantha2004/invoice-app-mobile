@@ -6,6 +6,7 @@ import type { User } from './api';
  * One file per user, so a rep's unsynced work never mixes with another rep's on a shared phone.
  *   outbox: requests made offline, sent to the server in order on Sync.
  *   meta:   'num:<kind>' = { prefix, digits, last } — this rep's own number range (see server/numbers.js).
+ *   paylog: invoices paid with the Pay button on this phone, and the day (Home "Payments" count). Kept across syncs.
  */
 const SCHEMA = `
   PRAGMA journal_mode = WAL;
@@ -13,7 +14,8 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, code TEXT, name TEXT, price REAL, unit TEXT, barcode TEXT);
   CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, kind TEXT, status TEXT, customerName TEXT, date TEXT, net REAL, json TEXT);
   CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, body TEXT, error TEXT);
-  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);`;
+  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+  CREATE TABLE IF NOT EXISTS paylog (no TEXT, date TEXT);`;
 
 export type Db = SQLite.SQLiteDatabase;
 let db: Db | null = null;

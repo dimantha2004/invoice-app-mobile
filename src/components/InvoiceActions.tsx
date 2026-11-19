@@ -49,6 +49,9 @@ export function InvoiceActions({ doc, onChanged }: { doc: Doc; onChanged: () => 
         <Btn title="Download" variant="outline" onPress={() => downloadInvoice(doc)} icon={<MaterialCommunityIcons name="download" size={26} color={C.textBlue} />} />
         <Btn title="Print" variant="outline" onPress={() => printInvoice(doc)} icon={<Ionicons name="print" size={26} color={C.textBlue} />} />
       </View>
+      {doc.kind === 'order' && doc.status === 'draft' && (
+        <Btn title="Edit Draft" variant="outline" onPress={() => router.push({ pathname: '/invoice-form', params: { draft: doc.id } })} style={{ flexGrow: 0, flexBasis: 'auto' }} />
+      )}
       {due > 0 && <Btn title={busy ? 'Saving…' : `Pay Rs. ${due.toFixed(2)}`} onPress={busy ? () => {} : () => setPaying(true)} style={{ flexGrow: 0, flexBasis: 'auto' }} />}
       {canConvert
         ? <Btn title={busy ? 'Creating…' : 'Convert to Invoice'} onPress={busy ? () => {} : () => setPaying(true)} style={{ flexGrow: 0, flexBasis: 'auto' }} />

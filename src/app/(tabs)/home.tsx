@@ -93,7 +93,7 @@ export default function Home() {
         <MenuRow title="New Invoice" href="/invoice-form" icon={<MaterialCommunityIcons name="receipt-text-check-outline" size={30} color={C.primary} />} />
         <MenuRow title="Payments" href="/payments" icon={<MaterialCommunityIcons name="cash-multiple" size={30} color={C.primary} />} />
         <MenuRow title="Orders/ Draft" href="/orders" icon={<MaterialCommunityIcons name="file-document-check-outline" size={30} color={C.primary} />} />
-        <MenuRow title="Reports" href="/summary" icon={<MaterialCommunityIcons name="clipboard-text-outline" size={30} color={C.primary} />} />
+        <MenuRow title="Reports" href="/reports" icon={<MaterialCommunityIcons name="clipboard-text-outline" size={30} color={C.primary} />} />
       </ScrollView>
     </View>
   );

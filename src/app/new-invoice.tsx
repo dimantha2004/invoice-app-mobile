@@ -2,9 +2,10 @@ import { useLocalSearchParams } from 'expo-router';
 import { Fragment, useState } from 'react';
 import { Alert, StyleSheet, Text, View } from 'react-native';
 import { ItemPickerSheet, PaymentSheet } from '../components/sheets';
-import { AddLink, Btn, ButtonRow, C, ItemsBox, NotesBox, Screen, TotalsCard } from '../components/ui';
+import { AddLink, Btn, ButtonRow, C, DateField, ItemsBox, NotesBox, Screen, TotalsCard } from '../components/ui';
 import { useDocSave } from '../components/useDocSave';
-import { dmy, FREE_TYPES, mergeLines, rs, today, totals, type FreeKind, type Line, type Payment } from '../lib/format';
+import { useApi } from '../lib/api';
+import { FREE_TYPES, mergeLines, rs, today, totals, type FreeKind, type Line, type Payment } from '../lib/format';
 import { useStore } from '../lib/store';
 
 /** Quick invoice/order for a customer chosen on "Select Customers". */
@@ -15,21 +16,25 @@ export default function NewInvoice() {
   const { save, saving } = useDocSave();
   const [lines, setLines] = useState<Line[]>([]);
   const [discount, setDiscount] = useState(0);
+  const [tax, setTax] = useState(0);
+  const [date, setDate] = useState(today());
+  const [end, setEnd] = useState('');
+  const next = useApi<{ number: string }>(`/${kind === 'order' ? 'orders' : 'invoices'}/next-number`);
   const [notes, setNotes] = useState('');
   const [picking, setPicking] = useState(false);
   const [paying, setPaying] = useState(false);
   const [free, setFree] = useState<Record<FreeKind, Line[]>>({ sample: [], exchange: [] });
   const [freePicking, setFreePicking] = useState<FreeKind | null>(null);
-  const date = today();
-  const { subTotal, net } = totals(lines, discount);
+  const { subTotal, net } = totals(lines, discount, tax);
   const label = kind === 'order' ? 'Order' : 'Invoice';
 
   const submit = (target: 'invoice' | 'order' | 'draft', payment?: Payment) => {
+    if (end && end < date) return Alert.alert('End date cannot be before the date');
     if (!lines.length) return Alert.alert('Add at least one item');
     if (discount > subTotal) return Alert.alert('Discount cannot be more than the total');
     if (target === 'invoice' && !payment) return setPaying(true);
     save(target, {
-      customerId: Number(params.customerId), date, discount, tax: 0, notes: notes.trim(), payment,
+      customerId: Number(params.customerId), date, dueDate: end || undefined, discount, tax, notes: notes.trim(), payment,
       lines: lines.map(l => ({ productId: l.productId, qty: l.qty })),
       samples: free.sample.map(l => ({ productId: l.productId, qty: l.qty })),
       exchanges: free.exchange.map(l => ({ productId: l.productId, qty: l.qty })),
@@ -40,13 +45,15 @@ export default function NewInvoice() {
     <Screen title={`New ${label}`} tab="invoices">
       <Text style={st.h}>Create {label}</Text>
       <View style={st.info}>
-        {[['Customer Name', params.customerName ?? '-'], ['Rep Name', store.user?.displayName ?? '-'], ['Date', dmy(date)]].map(([k, v]) => (
+        {[[`${label} No`, next.data ? `#${next.data.number}` : '-'], ['Customer Name', params.customerName ?? '-'], ['Rep Name', store.user?.displayName ?? '-']].map(([k, v]) => (
           <View key={k} style={st.infoRow}>
             <Text style={st.infoKey}>{k}</Text>
             <Text style={st.infoVal} numberOfLines={1}>{v}</Text>
           </View>
         ))}
       </View>
+      <DateField placeholder="Date" value={date} onChange={setDate} />
+      <DateField placeholder="End Date (optional)" value={end} onChange={setEnd} />
       <ItemsBox lines={lines} onRemove={id => setLines(l => l.filter(x => x.productId !== id))} />
       <AddLink title="Add Items" onPress={() => setPicking(true)} />
       {FREE_TYPES.map(([k, title]) => (
@@ -56,7 +63,7 @@ export default function NewInvoice() {
         </Fragment>
       ))}
       <View style={{ height: 24 }} />
-      <TotalsCard rows={[{ label: 'Total', value: rs(subTotal, 2) }, { label: 'Discount', edit: { value: discount, onChange: setDiscount } }]} net={rs(net, 2)} />
+      <TotalsCard rows={[{ label: 'Total', value: rs(subTotal, 2) }, { label: 'Discount', edit: { value: discount, onChange: setDiscount } }, { label: 'Tax', edit: { value: tax, onChange: setTax } }]} net={rs(net, 2)} />
       <NotesBox value={notes} onChangeText={setNotes} />
       {lines.length > 0 && (
         <ButtonRow>

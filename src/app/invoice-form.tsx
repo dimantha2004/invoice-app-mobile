@@ -1,26 +1,47 @@
+import { useLocalSearchParams } from 'expo-router';
 import { Fragment, useState } from 'react';
-import { Alert, Pressable, Text } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, Text } from 'react-native';
 import { CustomerSheet, ItemPickerSheet, PaymentSheet } from '../components/sheets';
 import { AddLink, Btn, ButtonRow, C, DateField, Field, ItemsBox, NotesBox, Screen, SelectField, TotalsCard } from '../components/ui';
 import { useDocSave } from '../components/useDocSave';
-import { useApi, type Customer } from '../lib/api';
+import { useApi, type Customer, type Doc } from '../lib/api';
 import { inactiveMsg } from '../lib/local';
 import { FREE_TYPES, mergeLines, rs, today, totals, type FreeKind, type Line, type Payment } from '../lib/format';
 
+/** "Create New Invoice", or `?draft=<order no>` to continue a saved draft (it is loaded first, then shown filled in). */
+export default function InvoiceFormScreen() {
+  const { draft } = useLocalSearchParams<{ draft?: string }>();
+  const d = useApi<Doc>(draft ? `/orders/${encodeURIComponent(draft)}` : null);
+  if (draft && !d.data) {
+    return (
+      <Screen title="Edit Draft" tab="invoices">
+        {d.error ? <Text style={{ color: C.danger, textAlign: 'center' }}>{d.error}</Text> : <ActivityIndicator color={C.primary} style={{ padding: 40 }} />}
+      </Screen>
+    );
+  }
+  return <InvoiceForm draft={d.data} />;
+}
+
+const toLine = ({ productId, code, name, unit, price, qty }: Line): Line => ({ productId, code, name, unit, price, qty });
+
 /** Full "Create New Invoice" form (Invoice Items List). The invoice number is made on the phone from the rep's own range. */
-export default function InvoiceForm() {
+function InvoiceForm({ draft }: { draft?: Doc }) {
   const customers = useApi<Customer[]>('/customers?q=');
+  const next = useApi<{ number: string }>('/invoices/next-number');
   const { save, saving } = useDocSave();
-  const [customerId, setCustomerId] = useState('');
-  const [start, setStart] = useState(today());
-  const [end, setEnd] = useState('');
-  const [lines, setLines] = useState<Line[]>([]);
-  const [discount, setDiscount] = useState(0);
-  const [tax, setTax] = useState(0);
-  const [notes, setNotes] = useState('');
+  const dl = draft?.lines ?? [];
+  const [customerId, setCustomerId] = useState(draft?.customerId != null ? String(draft.customerId) : '');
+  const [start, setStart] = useState(draft?.date ?? today());
+  const [end, setEnd] = useState(draft && draft.dueDate !== draft.date ? draft.dueDate : '');
+  const [lines, setLines] = useState<Line[]>(dl.filter(l => !l.free).map(toLine));
+  const [discount, setDiscount] = useState(draft?.discount ?? 0);
+  const [tax, setTax] = useState(draft?.tax ?? 0);
+  const [notes, setNotes] = useState(draft?.notes ?? '');
   const [picking, setPicking] = useState(false);
   const [paying, setPaying] = useState(false);
-  const [free, setFree] = useState<Record<FreeKind, Line[]>>({ sample: [], exchange: [] });
+  const [free, setFree] = useState<Record<FreeKind, Line[]>>({
+    sample: dl.filter(l => l.free === 'sample').map(toLine), exchange: dl.filter(l => l.free === 'exchange').map(toLine),
+  });
   const [freePicking, setFreePicking] = useState<FreeKind | null>(null);
   const [addingCustomer, setAddingCustomer] = useState(false);
   const { subTotal, net } = totals(lines, discount, tax);
@@ -39,13 +60,13 @@ export default function InvoiceForm() {
       lines: lines.map(l => ({ productId: l.productId, qty: l.qty })),
       samples: free.sample.map(l => ({ productId: l.productId, qty: l.qty })),
       exchanges: free.exchange.map(l => ({ productId: l.productId, qty: l.qty })),
-    });
+    }, draft?.number);
   };
 
   return (
-    <Screen title="Invoice Items List" tab="invoices">
-      <Text style={{ fontSize: 20, fontWeight: '600', color: C.text }}>Create New Invoice</Text>
-      <Field placeholder="Invoice Number (auto-generated)" editable={false} />
+    <Screen title={draft ? `Draft #${draft.number}` : 'Invoice Items List'} tab="invoices">
+      <Text style={{ fontSize: 20, fontWeight: '600', color: C.text }}>{draft ? 'Continue Draft' : 'Create New Invoice'}</Text>
+      <Field value={next.data ? `#${next.data.number}` : ''} placeholder="Invoice Number (auto-generated)" editable={false} style={{ color: '#555' }} />
       <SelectField placeholder={customers.loading ? 'Loading customers…' : customers.error ? 'Customers unavailable' : 'Customer'} value={customerId} onChange={setCustomerId}
         options={(customers.data ?? []).map(c => ({ label: `${c.name} (${c.code})${c.status === 'Inactive' ? ' · Inactive' : ''}`, value: String(c.id) }))} />
       <Pressable onPress={() => setAddingCustomer(true)} style={{ alignSelf: 'flex-end', marginTop: -6 }} hitSlop={8}>

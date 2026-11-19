@@ -6,6 +6,7 @@ type SyncData = {
   products: (Product & { barcode: string | null })[];
   invoices: Doc[];
   orders: Doc[];
+  returns?: Doc[];
   numbers: Record<NumKind, NumRange>;
 };
 
@@ -48,7 +49,7 @@ export async function sync() {
       c => [c.id, c.code, c.name, c.phone, c.address, c.status]);
     await insert('INSERT OR REPLACE INTO products (id, code, name, price, unit, barcode) VALUES (?, ?, ?, ?, ?, ?)', s.products,
       p => [p.id, p.code, p.name, p.price, p.unit, p.barcode]);
-    await insert('INSERT OR REPLACE INTO docs (id, kind, status, customerName, date, net, json) VALUES (?, ?, ?, ?, ?, ?, ?)', [...s.invoices, ...s.orders],
+    await insert('INSERT OR REPLACE INTO docs (id, kind, status, customerName, date, net, json) VALUES (?, ?, ?, ?, ?, ?, ?)', [...s.invoices, ...s.orders, ...(s.returns ?? [])],
       d => [d.id, d.kind, d.status, d.customerName, d.date, d.net, JSON.stringify(d)]);
     // Never step back in the rep's number range: the phone may already have used numbers the server has not seen.
     for (const [kind, n] of Object.entries(s.numbers)) {

@@ -85,7 +85,7 @@ const putDoc = (x: Db, d: Doc) =>
     d.id, d.kind, d.status, d.customerName, d.date, d.net, JSON.stringify(d));
 const getDoc = async (x: Db, id: string, kind: Doc['kind']) => {
   const r = await x.getFirstAsync<{ json: string }>('SELECT json FROM docs WHERE id = ? AND kind = ?', id, kind);
-  return r ? (JSON.parse(r.json) as Doc) : fail(`${kind === 'order' ? 'Order' : 'Invoice'} not found`);
+  return r ? (JSON.parse(r.json) as Doc) : fail(`${{ invoice: 'Invoice', order: 'Order', return: 'Return' }[kind]} not found`);
 };
 const queue = (x: Db, path: string, body: unknown) => x.runAsync('INSERT INTO outbox (path, body) VALUES (?, ?)', path, JSON.stringify(body));
 
@@ -95,6 +95,16 @@ async function listDocs(where: string[], args: string[], sort?: string) {
   return rows.map(r => JSON.parse(r.json) as Doc);
 }
 const count = async (sql: string, ...args: string[]) => (await getDb().getFirstAsync<{ n: number }>(sql, ...args))?.n ?? 0;
+/** Invoice count and totals, with the amount per payment type (a mix payment counts under each of its parts). */
+const sums = (rows: Doc[]) => {
+  const sum = (k: 'net' | 'discount' | 'tax' | keyof Payment) => round2(rows.reduce((s, d) => s + (d[k] ?? 0), 0));
+  return { count: rows.length, amount: sum('net'), discount: sum('discount'), tax: sum('tax'), cash: sum('cash'), cheque: sum('cheque'), online: sum('online'), credit: sum('credit') };
+};
+/** Extra WHERE for list screens: text search on number/customer and an optional day. */
+function listFilter(q: Record<string, string>, where: string[], args: string[]) {
+  if (q.q) { where.push('(id LIKE ? OR customerName LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`); }
+  if (q.date) { where.push('date = ?'); args.push(isoDate(q.date, 'date')); }
+}
 
 export async function localApi<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T> {
   return (await route(init?.method ?? 'GET', path, (init?.body ?? {}) as Body)) as T;
@@ -120,30 +130,49 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
       return getDb().getAllAsync<Product>(`SELECT id, code, name, price, unit FROM products
         WHERE name LIKE ? OR code LIKE ? OR barcode LIKE ? ORDER BY name LIMIT 100`, like, like, like);
     }
+    if (p === '/invoices/next-number') return { number: await peekNo('inv') };
+    if (p === '/orders/next-number') return { number: await peekNo('mso') };
+    if (p === '/returns/next-number') return { number: await peekNo('rtv') };
     if (p === '/invoices') {
       const where = [`kind = 'invoice'`], args: string[] = [];
       if (q.status === 'pending' || q.status === 'paid') { where.push('status = ?'); args.push(q.status); }
-      if (q.q) { where.push('(id LIKE ? OR customerName LIKE ?)'); args.push(like, like); }
-      if (q.date) { where.push('date = ?'); args.push(q.date); }
+      listFilter(q, where, args);
       const rows = await listDocs(where, args, q.sort);
-      const sum = (k: 'net' | keyof Payment) => round2(rows.reduce((s, d) => s + (d[k] ?? 0), 0));
-      return { rows, count: rows.length, amount: sum('net'), cash: sum('cash'), cheque: sum('cheque'), online: sum('online'), credit: sum('credit') };
+      return { rows, ...sums(rows) };
     }
     if ((id = m(/^\/invoices\/([^/]+)$/))) return getDoc(getDb(), id, 'invoice');
-    if (p === '/orders') {
-      return listDocs([`kind = 'order'`, `status IN ('draft', 'pending')`, '(id LIKE ? OR customerName LIKE ?)'], [like, like], q.sort);
+    if (p === '/orders' || p === '/returns') {
+      const where = [p === '/orders' ? `kind = 'order' AND status IN ('draft', 'pending')` : `kind = 'return'`], args: string[] = [];
+      listFilter(q, where, args);
+      return listDocs(where, args, q.sort);
     }
     if ((id = m(/^\/orders\/([^/]+)$/))) return getDoc(getDb(), id, 'order');
+    if ((id = m(/^\/returns\/([^/]+)$/))) return getDoc(getDb(), id, 'return');
     if (p === '/stats') {
       const t = today();
+      const todays = await listDocs([`kind = 'invoice'`, 'date = ?'], [t]);
+      // Payments today: today's invoices that took any cash/cheque/online, plus older invoices paid off today on this phone.
+      const paid = new Set(todays.filter(d => (d.cash ?? 0) + (d.cheque ?? 0) + (d.online ?? 0) > 0).map(d => d.id));
+      for (const r of await getDb().getAllAsync<{ no: string }>('SELECT no FROM paylog WHERE date = ?', t)) paid.add(r.no);
       return {
-        orders: await count(`SELECT COUNT(*) n FROM docs WHERE kind = 'order' AND status IN ('draft', 'pending')`),
-        invoices: await count(`SELECT COUNT(*) n FROM docs WHERE kind = 'invoice' AND date = ?`, t),
-        payments: await count(`SELECT COUNT(*) n FROM docs WHERE kind = 'invoice' AND date = ? AND status = 'paid'`, t),
+        orders: await count(`SELECT COUNT(*) n FROM docs WHERE kind = 'order' AND status IN ('draft', 'pending') AND date = ?`, t),
+        invoices: todays.length,
+        payments: paid.size,
         pending: await count('SELECT COUNT(*) n FROM outbox'),
       };
     }
-    if (p === '/returns/next-number') return { number: await peekNo('rtv') };
+    // ponytail: built from the invoices on this phone (the last 60 days, see /sync). Ask the server if longer ranges are needed.
+    if (p === '/reports') {
+      const from = isoDate(q.from, 'from date'), to = isoDate(q.to, 'to date');
+      if (to < from) fail('To date cannot be before from date');
+      const rows = await listDocs([`kind = 'invoice'`, 'date >= ?', 'date <= ?'], [from, to], 'oldest');
+      const items = new Map<string, { code: string; name: string; unit: string; qty: number; amount: number }>();
+      for (const l of rows.flatMap(d => d.lines ?? []).filter(l => !l.free)) {
+        const it = items.get(l.code) ?? { code: l.code, name: l.name, unit: l.unit, qty: 0, amount: 0 };
+        items.set(l.code, { ...it, qty: it.qty + l.qty, amount: round2(it.amount + l.amount) });
+      }
+      return { ...sums(rows), items: [...items.values()].sort((a, b) => b.amount - a.amount) };
+    }
   }
 
   if (method === 'POST') {
@@ -185,6 +214,17 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
         return d;
       });
     }
+    if ((id = m(/^\/orders\/([^/]+)$/))) {
+      const no = id, draft = b.status === 'draft';
+      return write(async tx => {
+        if ((await getDoc(tx, no, 'order')).status !== 'draft') fail('Only drafts can be edited');
+        const { doc, body } = await build(tx, b);
+        const d: Doc = { ...doc, id: no, number: no, kind: 'order', status: draft ? 'draft' : 'pending' };
+        await putDoc(tx, d);
+        await queue(tx, `/orders/${encodeURIComponent(no)}`, { ...body, status: draft ? 'draft' : 'submitted' });
+        return d;
+      });
+    }
     if ((id = m(/^\/orders\/([^/]+)\/invoice$/))) {
       const order = id;
       return write(async tx => {
@@ -192,7 +232,10 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
         if (o.status === 'paid') fail('This order is already invoiced');
         const c = await tx.getFirstAsync<{ status: string }>('SELECT status FROM customers WHERE id = ?', o.customerId);
         if (c?.status === 'Inactive') fail(inactiveMsg(o.customerName));
-        const date = today(), dueDate = o.dueDate > date ? o.dueDate : date;
+        // An edited draft sends the dates picked on the form; "Convert to Invoice" invoices it today.
+        const date = b.date ? isoDate(b.date, 'date') : today();
+        const dueDate = b.dueDate ? isoDate(b.dueDate, 'due date') : o.dueDate > date ? o.dueDate : date;
+        if (dueDate < date) fail('End date cannot be before start date');
         const pay = splitPayment(b.payment, o.net);
         const no = await takeNo(tx, 'inv');
         const d: Doc = {
@@ -218,6 +261,8 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
           credit: pay.credit, status: pay.credit > 0 ? 'pending' : 'paid',
         };
         await putDoc(tx, paid);
+        await tx.runAsync('DELETE FROM paylog WHERE date < ?', today());
+        await tx.runAsync('INSERT INTO paylog (no, date) VALUES (?, ?)', no, today());
         // `due` lets the server spot a payment it already has (sync retried after a lost reply).
         await queue(tx, `/invoices/${encodeURIComponent(no)}/pay`, { payment: pay, due });
         return paid;
@@ -225,17 +270,27 @@ async function route(method: string, path: string, b: Body): Promise<unknown> {
     }
     if (p === '/returns') {
       const number = str(b.number, 50, 'Return PO number', true).replace(/^#/, '');
-      isoDate(b.date, 'date');
-      str(b.reason, 100, 'Reason', true);
-      str(b.city, 100, 'City', true);
-      money(b.tax, 'tax');
-      str(b.notes, 800, 'Notes');
+      const date = isoDate(b.date, 'date');
+      const reason = str(b.reason, 100, 'Reason', true);
+      const city = str(b.city, 100, 'City', true);
+      const tax = money(b.tax, 'tax');
+      const notes = str(b.notes, 800, 'Notes');
       return write(async tx => {
+        const c = (await tx.getFirstAsync<Customer>('SELECT * FROM customers WHERE id = ?', Number(b.customerId))) ?? fail('Select a customer');
+        if (await tx.getFirstAsync('SELECT 1 FROM docs WHERE id = ?', number)) fail(`Number ${number} is already used`);
         const lines = await priceLines(tx, b.lines);
         // The suggested number uses this rep's range; a typed-in PO number leaves the range alone.
         if (number === (await peekNo('rtv', tx))) await takeNo(tx, 'rtv');
-        await queue(tx, '/returns', { ...b, number, lines: lines.map(l => ({ productId: l.productId, qty: l.qty, price: l.price })) });
-        return { ok: true, number };
+        const subTotal = round2(lines.reduce((s, l) => s + l.amount, 0));
+        const d: Doc = {
+          id: number, number, kind: 'return', status: b.status === 'draft' ? 'draft' : 'returned',
+          customerId: c.id, customerCode: c.code, customerName: c.name, customerAddress: c.address, rep: currentUser().displayName,
+          date, dueDate: date, subTotal, discount: 0, tax, net: round2(subTotal + tax),
+          notes: `Reason: ${reason}${notes ? ` | ${notes}` : ''}`, salesOrderNo: null, city, lines, // same Remarks text the server stores
+        };
+        await putDoc(tx, d);
+        await queue(tx, '/returns', { ...b, customerCode: c.code, number, lines: lines.map(l => ({ productId: l.productId, qty: l.qty, price: l.price })) });
+        return d;
       });
     }
   }

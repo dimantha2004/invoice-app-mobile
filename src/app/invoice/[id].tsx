@@ -9,9 +9,9 @@ import { COMPANY } from '../../lib/store';
 
 export default function InvoiceDetail() {
   const { id, kind } = useLocalSearchParams<{ id: string; kind?: string }>();
-  const isOrder = kind === 'order';
-  const { data: d, error, reload } = useApi<Doc>(`/${isOrder ? 'orders' : 'invoices'}/${encodeURIComponent(id)}`);
-  const title = isOrder ? 'Order' : 'Invoice';
+  const isOrder = kind === 'order', isReturn = kind === 'return';
+  const { data: d, error, reload } = useApi<Doc>(`/${isOrder ? 'orders' : isReturn ? 'returns' : 'invoices'}/${encodeURIComponent(id)}`);
+  const title = isOrder ? 'Order' : isReturn ? 'Return' : 'Invoice';
 
   if (!d) {
     return (
@@ -25,7 +25,7 @@ export default function InvoiceDetail() {
   return (
     <Screen title={`${title} #${d.number}`} tab="invoices">
       <View style={st.paper}>
-        <Text style={st.title}>{isOrder ? 'Sales Order' : 'Invoice'}</Text>
+        <Text style={st.title}>{isOrder ? 'Sales Order' : isReturn ? 'Sales Return' : 'Invoice'}</Text>
         <View style={st.top}>
           <Image source={require('../../../assets/images/logo.png')} style={{ width: 48, height: 48 }} />
           <View style={{ flex: 1, marginLeft: 14 }}>
@@ -44,7 +44,7 @@ export default function InvoiceDetail() {
           </View>
           <View style={{ flex: 1 }}>
             <Text style={st.b}>Sales Representative</Text><Text style={st.small}>{d.rep || '-'}</Text>
-            {[['Date:', dmy(d.date)], ['Due Date:', dmy(d.dueDate)], ...(d.salesOrderNo ? [['Sales Order:', d.salesOrderNo]] : [])].map(([k, v]) => (
+            {[['Date:', dmy(d.date)], ...(isReturn ? [['City:', d.city || '-']] : [['Due Date:', dmy(d.dueDate)]]), ...(d.salesOrderNo ? [['Sales Order:', d.salesOrderNo]] : [])].map(([k, v]) => (
               <Text key={k} style={st.small}><Text style={st.b}>{k}</Text>  {v}</Text>
             ))}
           </View>
@@ -80,7 +80,7 @@ export default function InvoiceDetail() {
         {!!d.notes && <Text style={[st.small, { marginHorizontal: 16, marginBottom: 16 }]}><Text style={st.b}>Notes</Text>: {d.notes}</Text>}
         <View style={{ height: 22, backgroundColor: C.primary, marginTop: 24 }} />
       </View>
-      <InvoiceActions doc={d} onChanged={reload} />
+      {!isReturn && <InvoiceActions doc={d} onChanged={reload} />}
     </Screen>
   );
 }

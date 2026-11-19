@@ -7,11 +7,11 @@ import { goTab } from './ui';
 /** Shared save for New Invoice / Invoice Items List: drafts go home, everything else to the confirmation screen. */
 export function useDocSave() {
   const [saving, setSaving] = useState(false);
-  const save = async (target: 'invoice' | 'order' | 'draft', body: DocInput) => {
+  const save = async (target: 'invoice' | 'order' | 'draft', body: DocInput, draftNo?: string) => {
     if (saving) return;
     setSaving(true);
     try {
-      const doc = await submitDoc(target, body);
+      const doc = await submitDoc(target, body, draftNo);
       if (target === 'draft') {
         Alert.alert('Draft saved', `Saved as ${doc.number}. Find it under Orders / Draft.`);
         goTab('home');

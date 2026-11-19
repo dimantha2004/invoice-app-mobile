@@ -23,7 +23,7 @@ export default function Settings() {
         <Text style={{ fontSize: 14, color: C.muted }}>Sales Representative</Text>
         <Text style={{ fontSize: 20, fontWeight: '700', color: C.text }}>{store.user?.displayName}</Text>
         <Text style={{ fontSize: 14, color: C.muted, marginTop: 2 }}>Username: {store.user?.username}</Text>
-        <Text style={{ fontSize: 15, color: C.textBlue, marginTop: 8 }}>{COMPANY.name}</Text>
+        <Text style={{ fontSize: 15, color: C.textBlue, marginTop: 8 }}>{store.user?.companyName || COMPANY.name}</Text>
         <Text style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>Server: {API_URL || 'not configured'}</Text>
       </View>
       <Row icon="document-text-outline" title="Orders / Draft" onPress={() => router.push('/orders')} />

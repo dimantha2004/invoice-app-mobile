@@ -178,7 +178,7 @@ export function DateField({ placeholder, value, onChange }: { placeholder: strin
         right={<Ionicons name="calendar-outline" size={22} color="#111" />} />
       {Platform.OS !== 'android' && (
         <Sheet visible={iosOpen} title={placeholder} onClose={() => setIosOpen(false)}>
-          <DateTimePicker value={current} mode="date" display="inline" onChange={(_, d) => { if (d) { onChange(isoDay(d)); setIosOpen(false); } }} />
+          <DateTimePicker value={current} mode="date" display="inline" themeVariant="light" onChange={(_, d) => { if (d) { onChange(isoDay(d)); setIosOpen(false); } }} />
         </Sheet>
       )}
     </>

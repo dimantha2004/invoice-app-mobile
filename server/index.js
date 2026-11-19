@@ -168,7 +168,7 @@ app.post('/login', async (req, res) => {
   const [u] = await q(`
     SELECT TOP 1 l.LoginId, l.Username, COALESCE(l.CompanyId, uc.CompanyId) CompanyId, u.DisplayName, uc.EmployeeId,
            COALESCE(NULLIF(LTRIM(RTRIM(e.NameWithInitials)), ''), NULLIF(LTRIM(RTRIM(e.FullName)), ''), u.DisplayName) RepName,
-           NULLIF(LTRIM(RTRIM(co.MainLoc)), '') MainLoc
+           NULLIF(LTRIM(RTRIM(co.MainLoc)), '') MainLoc, co.CompanyName
     FROM adm.Logins l
     JOIN adm.Users u ON u.UserId = l.LoginId
     OUTER APPLY (SELECT TOP 1 EmployeeId, CompanyId FROM adm.UserCompanies WHERE UserId = u.UserId AND ExpiryDate IS NULL ORDER BY IsDefault DESC, EmployeeId DESC) uc
@@ -187,7 +187,7 @@ app.post('/login', async (req, res) => {
   if (!u.MainLoc) throw new HttpError(403, 'Your company has no location code (MainLoc). Ask the office to set it up.');
   const user = {
     userId: u.LoginId, username: u.Username, displayName: u.RepName, employeeId: u.EmployeeId ?? null,
-    companyId: u.CompanyId ?? DEFAULT_COMPANY, mainLoc: u.MainLoc,
+    companyId: u.CompanyId ?? DEFAULT_COMPANY, companyName: u.CompanyName ?? '', mainLoc: u.MainLoc,
   };
   res.json({ token: signToken(user, env.AUTH_SECRET), user });
 });
@@ -475,42 +475,73 @@ async function orderWithLines(no, tx) {
 const orderNo = v => str(v, 50, 'Order', true);
 app.get('/orders/:no', async (req, res) => res.json(await orderWithLines(orderNo(req.params.no))));
 
-app.post('/orders', async (req, res) => {
-  const b = req.body ?? {};
-  const docNumber = ownNo('mso', req.user, b.number);
-  const status = b.status === 'draft' ? ST.draft : ST.submitted;
+/** An order/draft as sent by the phone: validated fields, customer, priced lines and totals. */
+async function readOrder(b, user, tx) {
   const date = isoDate(b.date, 'date');
   const dueDate = isoDate(b.dueDate, 'due date', false);
   if (dueDate && dueDate < date) bad('End date cannot be before start date');
   const discount = money(b.discount, 'discount'), tax = money(b.tax, 'tax'), notes = str(b.notes, 1000, 'Notes');
+  const customer = await customerByCode(b.customerCode, tx);
+  const lines = await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx, { keepPrice: true });
+  const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
+  if (discount > gross) bad('Discount cannot be more than the total');
+  return {
+    lines, customer, p: {
+      date, status: b.status === 'draft' ? ST.draft : ST.submitted, customerId: customer.CustomerId, address: customer.BillingAddress,
+      rep: user.employeeId, due: dueDate ?? date, gross, discount, tax, net: Math.round((gross - discount + tax) * 100) / 100,
+      notes: notes || null, userId: user.userId,
+    },
+  };
+}
 
+async function insertOrderLines(tx, id, docNumber, p, lines) {
+  for (const l of lines) {
+    await q(`
+      INSERT INTO sales.SalesOrderLines (SalesOrderId, DocNumber, DocDate, StatusEnum, ProductId, BaseUnitOfMeasureId, DocUnitOfMeasureId,
+        Quantity, QuantityInBase, BalanceQuantity, Price, DiscountPct, DiscountValue, GrossValue, TaxValue, NetValue, Remarks, CreationDate, CreatedUserId)
+      VALUES (@id, @docNumber, @date, @status, @productId, @uom, @uom, @qty, @qty, @qty, @price, 0, 0, @amount, 0, @amount, @free, GETDATE(), @userId)`,
+    { free: l.free ?? null, id, docNumber, date: p.date, status: p.status, productId: l.ProductId, uom: l.DefaultUnitOfMeasureId, qty: l.qty, price: l.price, amount: l.amount, userId: p.userId }, tx);
+  }
+}
+
+app.post('/orders', async (req, res) => {
+  const b = req.body ?? {};
+  const docNumber = ownNo('mso', req.user, b.number);
   await inTx(async tx => {
-    const customer = await customerByCode(b.customerCode, tx);
-    const lines = await pricedLines(b.lines, { sample: b.samples, exchange: b.exchanges }, tx, { keepPrice: true });
-    const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
-    if (discount > gross) bad('Discount cannot be more than the total');
-    const net = Math.round((gross - discount + tax) * 100) / 100;
+    const { customer, lines, p } = await readOrder(b, req.user, tx);
     const [dup] = await q(`SELECT CustomerId, CAST(FinalValue AS float) net FROM sales.SalesOrders WITH (UPDLOCK, HOLDLOCK) WHERE DocNumber = @docNumber`, { docNumber }, tx);
-    if (dup) { if (dup.CustomerId === customer.CustomerId && Math.abs(dup.net - net) <= 0.005) return; throw clash(docNumber); }
+    if (dup) { if (dup.CustomerId === customer.CustomerId && Math.abs(dup.net - p.net) <= 0.005) return; throw clash(docNumber); }
     const [o] = await q(`
       INSERT INTO sales.SalesOrders (CompanyId, DocNumber, DocDate, StatusEnum, CustomerId, BillingAddress, SalesRepEmployeeId, DeliveryDate,
         GrossValueTotal, LineDiscTotal, DocDiscValue, TaxValueTotal, NetValue, FinalValue, Remarks, CreationDate, SubmittedDate, CreatedUserId)
       OUTPUT INSERTED.SalesOrderId id
       VALUES (@companyId, @docNumber, @date, @status, @customerId, @address, @rep, @due, @gross, 0, @discount, @tax, @net, @net, @notes,
         GETDATE(), CASE WHEN @status = ${ST.submitted} THEN GETDATE() END, @userId)`,
-    {
-      companyId: req.user.companyId, docNumber, date, status, customerId: customer.CustomerId, address: customer.BillingAddress,
-      rep: req.user.employeeId, due: dueDate ?? date, gross, discount, tax, net, notes: notes || null, userId: req.user.userId,
-    }, tx);
-    for (const l of lines) {
-      await q(`
-        INSERT INTO sales.SalesOrderLines (SalesOrderId, DocNumber, DocDate, StatusEnum, ProductId, BaseUnitOfMeasureId, DocUnitOfMeasureId,
-          Quantity, QuantityInBase, BalanceQuantity, Price, DiscountPct, DiscountValue, GrossValue, TaxValue, NetValue, Remarks, CreationDate, CreatedUserId)
-        VALUES (@id, @docNumber, @date, @status, @productId, @uom, @uom, @qty, @qty, @qty, @price, 0, 0, @amount, 0, @amount, @free, GETDATE(), @userId)`,
-      { free: l.free ?? null, id: o.id, docNumber, date, status, productId: l.ProductId, uom: l.DefaultUnitOfMeasureId, qty: l.qty, price: l.price, amount: l.amount, userId: req.user.userId }, tx);
-    }
+    { ...p, companyId: req.user.companyId, docNumber }, tx);
+    await insertOrderLines(tx, o.id, docNumber, p, lines);
   });
   res.status(201).json(await orderWithLines(docNumber));
+});
+
+/** Save an edited draft over the old one (same number). Sending the same edit twice (a retried sync) gives the same result. */
+app.post('/orders/:no', async (req, res) => {
+  const docNumber = orderNo(req.params.no);
+  await inTx(async tx => {
+    const [o] = await q(`SELECT SalesOrderId id, StatusEnum status, CreatedUserId userId FROM sales.SalesOrders WITH (UPDLOCK, HOLDLOCK)
+      WHERE DocNumber = @docNumber AND ExpiryDate IS NULL`, { docNumber }, tx);
+    if (!o) throw new HttpError(404, `Order ${docNumber} not found`);
+    if (o.userId !== req.user.userId) bad(`Order ${docNumber} belongs to another sales rep`);
+    if (o.status === ST.invoiced) bad(`Order ${docNumber} is already invoiced`);
+    const { lines, p } = await readOrder(req.body ?? {}, req.user, tx);
+    await q(`
+      UPDATE sales.SalesOrders SET DocDate = @date, StatusEnum = @status, CustomerId = @customerId, BillingAddress = @address, DeliveryDate = @due,
+        GrossValueTotal = @gross, DocDiscValue = @discount, TaxValueTotal = @tax, NetValue = @net, FinalValue = @net, Remarks = @notes,
+        SubmittedDate = CASE WHEN @status = ${ST.submitted} THEN ISNULL(SubmittedDate, GETDATE()) END, ModifiedUserId = @userId
+      WHERE SalesOrderId = @id`, { ...p, id: o.id }, tx);
+    await q('DELETE FROM sales.SalesOrderLines WHERE SalesOrderId = @id', { id: o.id }, tx);
+    await insertOrderLines(tx, o.id, docNumber, p, lines);
+  });
+  res.json(await orderWithLines(docNumber));
 });
 
 /**
@@ -561,7 +592,9 @@ app.get('/sync', async (req, res) => {
   const myOrders = `SELECT o.SalesOrderId FROM sales.SalesOrders o WHERE o.ExpiryDate IS NULL AND o.CreatedUserId = @userId
     AND o.StatusEnum IN (${ST.draft}, ${ST.submitted})`;
   const formats = Object.fromEntries(KIND_LIST.map(k => [k, numberFormat(k, u.mainLoc, u.userId, bad)]));
-  const [customers, products, invoices, invLines, orders, ordLines, ...lasts] = await Promise.all([
+  const myReturns = `SELECT r.SalesReturnId FROM sales.SalesReturns r WHERE r.ExpiryDate IS NULL AND r.CreatedUserId = @userId
+    AND r.DocDate >= DATEADD(day, -60, CAST(GETDATE() AS date))`;
+  const [customers, products, invoices, invLines, orders, ordLines, returns, retLines, ...lasts] = await Promise.all([
     q(`${customerSelect} ORDER BY c.CustomerName`),
     q(`SELECT p.ProductId id, p.ProductCode code, p.ProductDescription name, CAST(p.SellingPrice AS float) price, ISNULL(u.UnitOfMeasure, 'Unit') unit, p.Barcode barcode
        FROM inv.Products p LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = p.DefaultUnitOfMeasureId WHERE p.ExpiryDate IS NULL`),
@@ -569,6 +602,8 @@ app.get('/sync', async (req, res) => {
     q(invoiceLines(`d.InvoiceNo IN (${myInvoices})`), params),
     q(`${orderSelect} WHERE o.SalesOrderId IN (${myOrders})`, params),
     q(orderLines(`o.SalesOrderId IN (${myOrders})`), params),
+    q(`${returnSelect} WHERE r.SalesReturnId IN (${myReturns})`, params),
+    q(returnLines(`r.SalesReturnId IN (${myReturns})`), params),
     ...KIND_LIST.map(k => {
       const [table, col] = NUMBER_COLUMNS[k], { prefix, digits } = formats[k];
       return q(`SELECT MAX(${col}) last FROM ${table} WHERE ${col} LIKE @like AND LEN(${col}) = @len`, { like: `${prefix}%`, len: prefix.length + digits });
@@ -578,10 +613,28 @@ app.get('/sync', async (req, res) => {
     const last = lasts[i][0]?.last;
     return [k, { ...formats[k], last: last ? Number(last.slice(formats[k].prefix.length)) : 0 }];
   }));
-  res.json({ customers, products, invoices: withLines(invoices, invLines), orders: withLines(orders, ordLines), numbers });
+  res.json({ customers, products, invoices: withLines(invoices, invLines), orders: withLines(orders, ordLines), returns: withLines(returns, retLines), numbers });
 });
 
 /* ---------- returns (sales.SalesReturns / SalesReturnLines) ---------- */
+
+// Same shape as an invoice/order so the phone lists and shows them the same way. CustomerAddress holds the return's city.
+const returnSelect = `
+  SELECT r.DocNumber id, r.DocNumber number, 'return' kind, CASE r.StatusEnum WHEN ${ST.draft} THEN 'draft' ELSE 'returned' END status,
+         r.CustomerId customerId, c.CustomerCode customerCode, ISNULL(c.CustomerName, '-') customerName, COALESCE(r.BilingAddress, c.BillingAddress) customerAddress,
+         ISNULL(u.DisplayName, '') rep, CONVERT(char(10), r.DocDate, 23) date, CONVERT(char(10), r.DocDate, 23) dueDate,
+         CAST(ISNULL(r.GrossValueTotal, 0) AS float) subTotal, CAST(0 AS float) discount, CAST(ISNULL(r.TaxValueTotal, 0) AS float) tax,
+         CAST(ISNULL(r.FinalValue, 0) AS float) net, ISNULL(r.Remarks, '') notes, NULL salesOrderNo, r.CustomerAddress city
+  FROM sales.SalesReturns r
+  LEFT JOIN sales.Customers c ON c.CustomerId = r.CustomerId
+  LEFT JOIN adm.Users u ON u.UserId = r.CreatedUserId`;
+
+const returnLines = where => `
+  SELECT r.DocNumber doc, l.ProductId productId, p.ProductCode code, p.ProductDescription name, ISNULL(u.UnitOfMeasure, 'Unit') unit,
+         CAST(l.Price AS float) price, CAST(l.Quantity AS float) qty, CAST(l.NetValue AS float) amount, NULL free
+  FROM sales.SalesReturnLines l JOIN sales.SalesReturns r ON r.SalesReturnId = l.SalesReturnId JOIN inv.Products p ON p.ProductId = l.ProductId
+  LEFT JOIN inv.UnitOfMeasures u ON u.UnitOfMeasureId = l.DocUnitOfMeasureId
+  WHERE ${where} ORDER BY l.SalesReturnLineId`;
 
 app.post('/returns', async (req, res) => {
   const b = req.body ?? {};
@@ -594,6 +647,8 @@ app.post('/returns', async (req, res) => {
   const status = b.status === 'draft' ? ST.draft : ST.submitted;
 
   await inTx(async tx => {
+    // Returns queued on a phone before the customer field was added have no customerCode.
+    const customer = b.customerCode ? await customerByCode(b.customerCode, tx) : null;
     const lines = await priceLines(b.lines, tx, { keepPrice: true });
     const gross = Math.round(lines.reduce((s, l) => s + l.amount, 0) * 100) / 100;
     const net = Math.round((gross + tax) * 100) / 100;
@@ -602,12 +657,12 @@ app.post('/returns', async (req, res) => {
       WHERE DocNumber = @docNumber`, { docNumber }, tx);
     if (dup) { if (dup.userId === req.user.userId && Math.abs(dup.net - net) <= 0.005) return; throw new HttpError(409, `Return PO number ${docNumber} already exists`); }
     const [r] = await q(`
-      INSERT INTO sales.SalesReturns (CompanyId, DocNumber, DocDate, StatusEnum, CustomerAddress, GrossValueTotal, LineDiscTotal, DocDiscValue,
+      INSERT INTO sales.SalesReturns (CompanyId, DocNumber, DocDate, StatusEnum, CustomerId, BilingAddress, CustomerAddress, GrossValueTotal, LineDiscTotal, DocDiscValue,
         TaxValueTotal, NetValue, FinalValue, Remarks, CreationDate, SubmittedDate, CreatedUserId)
       OUTPUT INSERTED.SalesReturnId id
-      VALUES (@companyId, @docNumber, @date, @status, @city, @gross, 0, 0, @tax, @net, @net, @remarks, GETDATE(),
+      VALUES (@companyId, @docNumber, @date, @status, @customerId, @billing, @city, @gross, 0, 0, @tax, @net, @net, @remarks, GETDATE(),
         CASE WHEN @status = ${ST.submitted} THEN GETDATE() END, @userId)`,
-    { companyId: req.user.companyId, docNumber, date, status, city, gross, tax, net, remarks: `Reason: ${reason}${notes ? ` | ${notes}` : ''}`, userId: req.user.userId }, tx);
+    { customerId: customer?.CustomerId ?? null, billing: customer?.BillingAddress ?? null, companyId: req.user.companyId, docNumber, date, status, city, gross, tax, net, remarks: `Reason: ${reason}${notes ? ` | ${notes}` : ''}`, userId: req.user.userId }, tx);
     for (const l of lines) {
       await q(`
         INSERT INTO sales.SalesReturnLines (SalesReturnId, StatusEnum, DocUnitOfMeasureId, ProductId, Quantity, QuantityInBase, Price, DiscountPct,

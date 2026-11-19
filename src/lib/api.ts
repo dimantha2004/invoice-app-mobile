@@ -5,13 +5,13 @@ import { localApi } from './local';
 
 export const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/$/, '');
 
-export type User = { userId: number; username: string; displayName: string; employeeId: number | null; companyId: number };
+export type User = { userId: number; username: string; displayName: string; employeeId: number | null; companyId: number; companyName?: string };
 export type Customer = { id: number; code: string; name: string; phone: string | null; address: string | null; status: string };
 export type Product = { id: number; code: string; name: string; price: number; unit: string };
-export type DocStatus = 'draft' | 'pending' | 'paid';
-/** An invoice (dbo.InvoiceHead) or a sales order / draft (sales.SalesOrders), as returned by the API. */
+export type DocStatus = 'draft' | 'pending' | 'paid' | 'returned';
+/** An invoice (dbo.InvoiceHead), a sales order / draft (sales.SalesOrders) or a return (sales.SalesReturns), as returned by the API. */
 export type Doc = Partial<Payment> & {
-  id: string; number: string; kind: 'invoice' | 'order'; status: DocStatus;
+  id: string; number: string; kind: 'invoice' | 'order' | 'return'; status: DocStatus; city?: string | null;
   customerId: number | null; customerCode: string | null; customerName: string; customerAddress: string | null;
   rep: string; date: string; dueDate: string; subTotal: number; discount: number; tax: number; net: number;
   notes: string; salesOrderNo: string | null; lines?: (Line & { amount: number; free?: FreeKind | null })[];
@@ -60,8 +60,17 @@ export type DocInput = {
   payment?: Payment;
 };
 
-/** Saved on the phone, then on Sync: invoice -> dbo.InvoiceHead; order and any draft -> sales.SalesOrders. */
-export function submitDoc(target: 'invoice' | 'order' | 'draft', body: DocInput) {
+/**
+ * Saved on the phone, then on Sync: invoice -> dbo.InvoiceHead; order and any draft -> sales.SalesOrders.
+ * `draftNo`: an edited draft keeps its number. It is saved again, then (for an invoice) converted with the payment.
+ */
+export async function submitDoc(target: 'invoice' | 'order' | 'draft', body: DocInput, draftNo?: string) {
+  if (draftNo) {
+    const path = `/orders/${encodeURIComponent(draftNo)}`;
+    const o = await api<Doc>(path, { method: 'POST', body: { ...body, status: target === 'order' ? 'submitted' : 'draft' } });
+    if (target !== 'invoice') return o;
+    return api<Doc>(`${path}/invoice`, { method: 'POST', body: { payment: body.payment, date: body.date, dueDate: body.dueDate } });
+  }
   return target === 'invoice'
     ? api<Doc>('/invoices', { method: 'POST', body })
     : api<Doc>('/orders', { method: 'POST', body: { ...body, status: target === 'draft' ? 'draft' : 'submitted' } });
